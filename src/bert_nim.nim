@@ -2,7 +2,7 @@
 ##
 ## Build:  nimble build
 ## Run:    nimble runNim          (sets PYTHONPATH to the venv, see bert.nimble)
-##   or:   PYTHONPATH=/home/ljoeckel/bert_env/lib/python3.12/site-packages ./bert_nim
+##   or:   PYTHONPATH=/home/ljoeckel/hnsw_env/lib/python3.12/site-packages ./bert_nim
 ##
 ## nimpy embeds a CPython interpreter into this binary (it dlopens libpython at
 ## runtime), so this process *becomes* a Python host. Everything the Python code
@@ -10,22 +10,14 @@
 ## interpreter. Since we embed the system libpython3.12, the venv's
 ## site-packages are supplied through PYTHONPATH.
 
-import std/[os, strformat, strutils]
+import bakery
 import nimpy
 import nimpy/raw_buffers   # for the zero-copy numpy path
 
-# --- Let the embedded interpreter find our Python code ----------------------
-# nimpy initialises Python with Py_InitializeEx(), which does *not* add this
-# directory to sys.path (unlike running `python script.py`), so do it by hand
-# before any `pyImport` of our own module.
-discard pyImport("sys").path.insert(0, currentSourcePath().parentDir)
+# bakery registers this in sys.modules at init; take the module from there
+# rather than pyImport("sbert_bridge"), so the import is a real dependency.
+let bridge = bakery.bridge
 
-# Imported once. sbert_bridge loads the model at import time, so this line is
-# the expensive one (a few seconds) - keep it out of hot loops.
-let bridge = pyImport("sbert_bridge")
-
-# Embedding size of the loaded model, asked from Python (384 for MiniLM-L6).
-let dim = bridge.dim().to(int)
 
 proc embed*(texts: seq[string]): seq[seq[float32]] =
   ## One embedding per text: `texts.len` vectors of `dim` floats.
@@ -89,8 +81,14 @@ proc query*(
   ## text is not part of the corpus.
   bridge.query(queryVector, embeddings, texts, topK, skipSelf).to(seq[QueryHit])
 
+# ------------------------------------------------------------------------
 
 when isMainModule:
+  import std/[strformat, strutils]    
+
+  # Embedding size of the loaded model, asked from Python (384 for MiniLM-L6).
+  let dim = bridge.dim().to(int)
+
   let texts = @[
     "MacMini has a M4 chip",
     "Apple releases new MacBook Pro with M4 chip",

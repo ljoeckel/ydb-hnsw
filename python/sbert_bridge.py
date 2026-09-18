@@ -37,7 +37,9 @@ if THREADS > 1:
 import numpy as np
 import torch
 from sentence_transformers import SentenceTransformer, util
+from transformers.utils import logging
 
+logging.set_verbosity_error()   # hides the LOAD REPORT and misc warnings
 torch.set_num_threads(THREADS)
 
 #MODEL_NAME = "all-MiniLM-L6-v2"

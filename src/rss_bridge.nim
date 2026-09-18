@@ -1,4 +1,3 @@
-import std/enumerate
 import yottadb
 import types
 

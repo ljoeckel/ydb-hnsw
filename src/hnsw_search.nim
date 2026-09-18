@@ -6,10 +6,9 @@ import hnsw
 import rss_bridge
 import yottadb
 import types
-import ydbutils
 
 
-const Index = "^HNSWArticlesQ"
+const Index = "^HNSWArticles"
 
 proc getRssRef(id: int): seq[string] =
     let rssref = Get ^HNSWArticlesKEY(id)
@@ -33,11 +32,9 @@ proc showHit(hit: Hit) =
 proc findDuplicates(ix: HnswIndex, label: string, q: seq[float32], k = 5) =
     var t = newTable[string, seq[Hit]]()
 
-    var probHits: seq[Hit]
     for hit in ix.search(q, k = k):
         let sim = 1.0'f32 - hit.dist
         if sim > 0.5:
-            #probHits.add(hit)
             t.mgetOrPut(getTitle(hit.id), @[]).add(hit)
  
     
@@ -62,18 +59,7 @@ proc showHits(ix: HnswIndex, label: string, q: seq[float32], k = 5) =
 when isMainModule:
     var ix = openHnsw(Index, M = 16, efConstruction = 200, efSearch = 64)
 
-    # var title = "wolfgang"
-    # showHits(ix, title, embed(@[hnswNormalize(title)])[0] )
-    # title = "wolfgang kubicki"
-    # showHits(ix, title, embed(@[hnswNormalize(title)])[0] )
-    # title = "wolfgang kubicki fdp"
-    # showHits(ix, title, embed(@[hnswNormalize(title)])[0] )
-    # title = "wolfgang kubicki fdp strack-zimmermann"
-    # showHits(ix, title, embed(@[hnswNormalize(title)])[0] )
-    # title = "wolfgang kubicki fdp strack-zimmermann gewinnt wahl"
-    # showHits(ix, title, embed(@[hnswNormalize(title)])[0] , k=10)
-
-    for (cnt, idxref, title) in enumerate(RSSItemIter(1000)):
+    for (cnt, idxref, title) in enumerate(RSSItemIter(25)):
         let nTitle = hnswNormalize(title)
         findDuplicates(ix, title, embed(@[nTitle])[0] , k=10)
         #if cnt mod 1000 == 0:
