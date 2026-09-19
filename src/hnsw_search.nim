@@ -5,7 +5,7 @@ import bert_nim     # nimpy glue: embed(); its own demo stays dormant
 import hnsw
 import rss_bridge
 import yottadb
-import types
+import rsstypes
 
 
 const Index = "^HNSWArticles"
@@ -23,47 +23,87 @@ proc getTitle(id: int): string =
     return hnswNormalize(title)
 
 
-proc showHit(hit: Hit) =
-    let title = getTitle(hit.id)
-    let sim = 1.0'f32 - hit.dist
-    echo &"  {hit.id:8d}  sim={sim:.4f}  {title}"
+proc getDescription(id: int): string = 
+    let rssRef = getRssRef(id)
+    let s = Get ^RSSItem(rssref, "description")
+    let description = s.parseHtml().innerText
+    return hnswNormalize(description)
 
 
-proc findDuplicates(ix: HnswIndex, label: string, q: seq[float32], k = 5) =
+proc sanitize(label: string): bool =
+    if label.isEmptyOrWhitespace(): return true
+    if label == "mehr": return true
+    false
+
+
+proc delete(ix: HnswIndex, hit: Hit) =
+    # Get rssref to access ydb
+    let rssref = getRssRef(hit.id)
+    if rssref.len == 0:
+        echo &"Could not find storage reference {rssref}"
+        return
+
+    # Remove form HNSW vector db
+    let rc = ix.delete(hit.id)
+    if not rc:
+        echo &"Could not delete {hit.id} from HNSW index"
+        return
+    else:
+        echo &"Removed {hit.id} from HNSW index"
+
+    # Remove from YottaDB
+    deleteObject[RSSItem](rssref)
+    echo &"Removed {rssref} from YDB"
+
+
+proc findAndRemoveDuplicates(ix: HnswIndex, headline: string, k = 5) =
     var t = newTable[string, seq[Hit]]()
+    let title = hnswNormalize(headline)
+    let q = embed(@[title])[0]
 
+    # collect articles that seams are related
     for hit in ix.search(q, k = k):
         let sim = 1.0'f32 - hit.dist
-        if sim > 0.5:
+        if sim > 0.6:
             t.mgetOrPut(getTitle(hit.id), @[]).add(hit)
- 
-    
+     
     for title, hits in t:
         if hits.len > 1:
-            echo title
+            # sanitize
             for hit in hits:
-                let rssRef = getRssRef(hit.id)
-                let rssItem = loadObject[RSSItem](rssRef)
-                let opthtml = getOption(rssItem.description)
-                let description = opthtml.parseHtml().innerText
-                echo "  id:", hit.id, " rssRef:", rssRef, "  ", description
+                let description = getDescription(hit.id)
+                if sanitize(description):
+                    echo &"EMPTY       id:{hit.id} {description}"
+                    delete(ix, hit)
 
-
-proc showHits(ix: HnswIndex, label: string, q: seq[float32], k = 5) =
-  echo label
-  for hit in ix.search(q, k = k):
-    showHit(hit)
+            var lastDescription = ""
+            for hit in hits:
+                let description = getDescription(hit.id)
+                if lastDescription != "" and description == lastDescription:
+                    echo &"REDUNDANT   id:{hit.id} {description}"
+                    delete(ix, hit)
+                lastDescription = description
 
 
 
 when isMainModule:
     var ix = openHnsw(Index, M = 16, efConstruction = 200, efSearch = 64)
 
-    for (cnt, idxref, title) in enumerate(RSSItemIter(25)):
-        let nTitle = hnswNormalize(title)
-        findDuplicates(ix, title, embed(@[nTitle])[0] , k=10)
-        #if cnt mod 1000 == 0:
-        #    updateDBStats("hnsw_search")
+    # let t = "das naechste gaspreis hoch bei equinor klingelt die kasse weiter"
+    # let tds = findDuplicates(ix, t)
 
-    updateDBStats("hnsw_search")
+    # for hit in tds:
+    #     if delete(ix, hit):
+    #         echo &"Removed {hit.id} from HNSW and YottaDB"
+    #     else:
+    #         echo &"Could not remove {hit.id} from HNSW and YottaDB"
 
+    
+
+    for (cnt, idxref, title) in enumerate(RSSItemIter()):
+        findAndRemoveDuplicates(ix, title, k=10)
+        if cnt mod 100 == 0:
+            echo cnt, " ", title
+            updateDBStats("hnsw_clean")
+
+    updateDBStats("hnsw_clean")

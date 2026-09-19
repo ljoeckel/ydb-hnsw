@@ -1,5 +1,5 @@
 import yottadb
-import types
+import rsstypes
 
 proc isInDB*(idxref: string): bool =
     0 != Data ^HNSWArticlesKEY(idxref)
@@ -14,9 +14,7 @@ iterator RSSItemIter*(maxitems: int = int.high, reverse: bool = false): (string,
 
     if reverse:
         for item in OrderItr ^RSSItem.reverse:
-            echo item
             for idxref in OrderItr ^RSSItem(item, "").keys:
-                echo "  ",idxref
                 yield getItem(idxref)
                 dec cnt
                 if cnt <= 0: break
