@@ -3,7 +3,6 @@ nimblecache/
 htmldocs/
 hnsw_env/
 src/__pycache__/
-nimble.paths
 hnsw_search
 hnsw_articles
 hnsw_clean
