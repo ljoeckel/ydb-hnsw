@@ -143,7 +143,7 @@ when isMainModule:
     echo "Scanning Articles"
 
     var titles: seq[string]
-    for (_, title) in RSSItemIter(500):
+    for (_, title) in RSSItemIter(5000, reverse=true):
         titles.add(hnswNormalize(title))
     echo &"Have {titles.len} titles"
 
