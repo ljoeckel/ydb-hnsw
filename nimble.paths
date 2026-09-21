@@ -6,6 +6,6 @@
 --path:"/home/ljoeckel/git/nim-yottadb/src"
 --path:"/home/ljoeckel/git/nimydbsamples/src/rss"
 #--path:"/home/ljoeckel/bert"
---path:"/home/ljoeckel/.nimble/pkgs2/nimpy-0.2.1-0e88588fb093806b3e2d9f2a4b7e507abf863958"
+--path:"/home/ljoeckel/.nimble/pkgs2/nimpy-0.2.1-22173fb24ce9ca9d1c1db63fe15bdfb14e69c76a"
 --path:"/home/ljoeckel/.nimble/pkgs2/nimlz4-0.1.0-a2e5b5702105eb5850c43e754f4f05b97ad3b28b"
 #--path:"/home/ljoeckel/.nimble/pkgs2/htmlparser-0.1.0-4bdb724dcb3cd450d0a743fc21a5f9752ad8be7e"

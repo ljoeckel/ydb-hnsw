@@ -1,4 +1,4 @@
-import std/[os, strformat, strutils, tables, enumerate]
+import std/[os, strformat, strutils, tables]
 import std/[htmlparser, xmltree]
 
 import bert_nim     # nimpy glue: embed(); its own demo stays dormant
@@ -8,7 +8,7 @@ import yottadb
 import rsstypes
 
 
-const Index = "^HNSWArticles"
+var empty, duplicates = 0
 
 proc getRssRef(id: int): seq[string] =
     let rssref = Get ^HNSWArticlesKEY(id)
@@ -56,9 +56,8 @@ proc delete(ix: HnswIndex, hit: Hit) =
     echo &"Removed {rssref} from YDB"
 
 
-proc findDuplicates(ix: HnswIndex, headline: string, k = 5) =
+proc findDuplicates(ix: HnswIndex, vec: seq[float32], k = 5) =
     var t = newTable[string, seq[Hit]]()
-    let vec = embed(@[hnswNormalize(headline)])[0]
 
     # collect articles that seams are related
     for hit in ix.search(vec, k = k):
@@ -66,22 +65,25 @@ proc findDuplicates(ix: HnswIndex, headline: string, k = 5) =
         if sim > 0.6:
             t.mgetOrPut(getTitle(hit.id), @[]).add(hit)
 
-    echo headline
+    #echo headline
 
     for title, hits in t:
         # sanitize
         for hit in hits:
             let description = getDescription(hit.id)
             let sim = 1.0'f32 - hit.dist
-            echo &"   {sim} {description}"
+            #echo &"   {sim} {description}"
             if sanitize(description):
-                echo &"EMPTY       id:{hit.id}, rssRef:{getRssRef(hit.id)}" 
+                inc empty
+                #echo &"EMPTY       id:{hit.id}, rssRef:{getRssRef(hit.id)}" 
+                discard
 
         var lastDescription = ""
         for hit in hits:
             let description = getDescription(hit.id)
             if lastDescription != "" and description == lastDescription:
-                echo &"REDUNDANT   id:{hit.id}, rssRef:{getRssRef(hit.id)}"
+                #echo &"REDUNDANT   id:{hit.id}, rssRef:{getRssRef(hit.id)}"
+                inc duplicates
             lastDescription = description
 
 
@@ -115,12 +117,12 @@ proc findAndRemoveDuplicates(ix: HnswIndex, headline: string, k = 5) =
 
 
 when isMainModule:
-    var ix = openHnsw(HnswParams(global: "^HNSWArticles"))
+    #var ix = openHnsw(HnswParams(global: "^HNSWArticlesQ", quant: vqInt8))
     #var ix = openHnsw(Index, M = 16, efConstruction = 200, efSearch = 64)
 
     #let t = hnswNormalize("Anschläge auf Umspannwerke: Verband: Brauchen Backup-System für Notfälle im Stromnetz")
-    let t = hnswNormalize("Sabotage - Polizei findet zwölf Sprengsätze an Stromtrassen in Sachsen - Fahndung mit Foto nach Tatverdächtigem aus NRW")
-    findDuplicates(ix, t)
+    #let t = hnswNormalize("Sabotage - Polizei findet zwölf Sprengsätze an Stromtrassen in Sachsen - Fahndung mit Foto nach Tatverdächtigem aus NRW")
+    #findDuplicates(ix, t)
 
     # for hit in tds:
     #     if delete(ix, hit):
@@ -130,10 +132,36 @@ when isMainModule:
 
     
 
-    # for (cnt, idxref, title) in enumerate(RSSItemIter()):
-    #     findAndRemoveDuplicates(ix, title, k=10)
-    #     if cnt mod 100 == 0:
-    #         echo cnt, " ", title
-    #         updateDBStats("hnsw_clean")
+    # Embedding one headline per call costs ~12 ms of pure per-call overhead
+    # (Python dispatch, tokenizer, kernel launches) and no number of CPU
+    # threads changes that - SBERT_THREADS only parallelises the matrix work
+    # *inside* one call, which is negligible for a batch of 1. The same model
+    # does ~0.3 ms per text in batches, so collect the titles first and embed
+    # them in bulks. Measured on this box: 2000 single calls 23.3 s vs 3.6 s
+    # for the batched version, i.e. most of the run time of this program.
+    const BatchSize = 128
+    echo "Scanning Articles"
 
-    # updateDBStats("hnsw_clean")
+    var titles: seq[string]
+    for (_, title) in RSSItemIter(500):
+        titles.add(hnswNormalize(title))
+    echo &"Have {titles.len} titles"
+
+    #let params = HnswParams(global: "^HNSWArticles")
+    let params = HnswParams(global: "^HNSWArticlesQ", quant: vqInt8)
+    echo &"Opening the HNSW index with {params}"
+
+    var ix = openHnsw(params)
+    echo ix.levelsSummary()
+
+    for start in countup(0, titles.len - 1, BatchSize):
+        let stop = min(start + BatchSize, titles.len)
+        let flat = embedFlat(titles[start ..< stop])
+        if flat.len == 0: continue
+        let dim = flat.len div (stop - start)
+        for i in start ..< stop:
+            findDuplicates(ix, flat[(i - start) * dim ..< (i - start + 1) * dim], k=10)
+        echo stop - 1, " ", titles[stop - 1]
+
+    echo "     Empty: ", empty
+    echo "Duplicates: ", duplicates

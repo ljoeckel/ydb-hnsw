@@ -18,8 +18,12 @@ requires "https://github.com/ljoeckel/nimlz4.git"
 # the venv packages (sentence_transformers, numpy, torch) have to be handed to
 # it through PYTHONPATH. Set EDIT if the venv moves (see ~/bert.sh).
 const
-  VenvSitePackages = "/home/ljoeckel/bert_env/lib/python3.12/site-packages"
+  VenvSitePackages = "/home/ljoeckel/git/hnsw_env/lib/python3.14/site-packages"
 
 task runNim, "Build and run the Nim host with the venv on PYTHONPATH":
   exec "nimble build"
   exec "PYTHONPATH=" & VenvSitePackages & " ./bert_nim"
+
+task runHnsw, "Build and run hnsw_search with the venv on PYTHONPATH":
+  exec "nim c -d:release src/hnsw_search.nim"
+  exec "PYTHONPATH=" & VenvSitePackages & " ./src/hnsw_search"

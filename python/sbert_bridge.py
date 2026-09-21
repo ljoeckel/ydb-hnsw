@@ -9,28 +9,35 @@ Nim build (see `bert_nim.nim`).
 import os
 
 # --- threading: configured before torch (and MKL) are imported --------------
-# This machine's CPU (Xeon E5-1620 v2 / Ivy Bridge) has AVX and SSE4.2 but no
-# AVX2/AVX-512, while the Intel MKL bundled with torch was observed executing an
-# AVX-512 kernel from a worker thread (vmovdqu64 ... %zmm13, inside
+# HISTORICAL - the old box (Xeon E5-1620 v2 / Ivy Bridge) has AVX and SSE4.2 but
+# no AVX2/AVX-512, while the Intel MKL bundled with torch was observed executing
+# an AVX-512 kernel from a worker thread (vmovdqu64 ... %zmm13, inside
 # mkl_vml_kernel_sTanh_Z0HAynn) -> SIGILL / exit 132, intermittent and only
 # under concurrent load. That is why the default here is a single thread, on top
 # of ~/.bashrc exporting OMP_NUM_THREADS=1 MKL_NUM_THREADS=1.
 #
-# More cores are there (4 cores / 8 threads) and they do help large batches -
-# measured on 256 short texts: 1 thread 55 texts/s, 4 threads 193 texts/s,
-# 8 threads 188 texts/s (hyperthreading on 4 physical cores does not pay off).
-# Opt in deliberately, with the guardrail that pins MKL to a kernel class this
-# CPU really supports so the AVX-512 path cannot be taken:
+# The current box is a Core Ultra 7 155H (AVX2, no AVX-512) and its shell does
+# not export either variable, so single threaded is now just the conservative
+# default, not a necessity. Opt in deliberately, with MKL_ENABLE_INSTRUCTIONS as
+# the guardrail that pins MKL to a kernel class the CPU really supports, should
+# the AVX-512 crash ever come back (it is not set from here on purpose: it would
+# also cap MKL on a machine that could legitimately use AVX2/AVX-512):
 #
 #   SBERT_THREADS=4 MKL_ENABLE_INSTRUCTIONS=SSE4_2 nimble runHnsw
 #
-# MKL_ENABLE_INSTRUCTIONS is not set from here on purpose: it would also cap MKL
-# on a machine that could legitimately use AVX2/AVX-512.
+# Threads only pay off for *batched* calls, and only modestly: a batch amortises
+# the per-call overhead (Python dispatch, tokenizer, kernel launches) over many
+# texts, and is the only case where the matrix work is big enough to split.
+# Measured on the current box, 2000 headlines embedded one call at a time:
+# 23.3 s with SBERT_THREADS=1 and 23.6 s with 4 (on the old box: 1 thread
+# 55 texts/s, 4 threads 193 texts/s for batches of 256). So a caller that embeds
+# one text per call cannot be fixed with a thread count - it has to batch first
+# (hnsw_search.nim does, in bulks of 128: 23.3 s -> 1.4 s for the same work).
 THREADS = max(1, int(os.environ.get("SBERT_THREADS", "1")))
 if THREADS > 1:
-    # MKL prioritises MKL_NUM_THREADS over OMP_NUM_THREADS, and the shell exports
-    # both as 1, so torch.set_num_threads() alone would leave MKL single
-    # threaded. These have to be in place before the libraries are loaded.
+    # MKL prioritises MKL_NUM_THREADS over OMP_NUM_THREADS, and the old shell
+    # exported both as 1, so torch.set_num_threads() alone would leave MKL
+    # single threaded. These have to be in place before the libraries load.
     os.environ["OMP_NUM_THREADS"] = str(THREADS)
     os.environ["MKL_NUM_THREADS"] = str(THREADS)
 
@@ -41,6 +48,32 @@ from transformers.utils import logging
 
 logging.set_verbosity_error()   # hides the LOAD REPORT and misc warnings
 torch.set_num_threads(THREADS)
+
+# --- stop tqdm from registering a multiprocessing semaphore -------------------
+# The first progress bar (transformers' "Loading weights" here, and the
+# "Batches" bar that encode() builds via trange) makes tqdm create a
+# class-level multiprocessing.RLock - tqdm/std.py, TqdmDefaultWriteLock.
+# create_mp_lock. Two consequences in this embedded host:
+#
+#   * Python 3.14 defaults to the "forkserver" start method, so that SemLock
+#     gets a name and multiprocessing/synchronize.py:78 registers it with the
+#     resource tracker; the matching unregister is deferred to interpreter
+#     shutdown (util.Finalize, exitpriority=0). There is no interpreter
+#     shutdown here (nimpy never finalises), so the tracker reports
+#     "There appear to be 1 leaked semaphore objects ... {'/loky-...'}" at the
+#     end of every run. It is only cosmetic - the tracker unlinks the semaphore
+#     right after warning, /dev/shm stays empty and the exit code stays 0 - but
+#     it is noise on stderr after the results.
+#   * The "/loky-" prefix is misleading: joblib/loky (pulled in transitively by
+#     sentence-transformers) monkey-patches the *stdlib* SemLock name factory.
+#     No loky worker is ever started.
+#
+# A None mp_lock leaves tqdm with its threading lock only, which is all a
+# single-process writer needs. transformers.utils.logging.disable_progress_bar()
+# would not be enough - it does not cover sentence-transformers' own trange.
+import tqdm.std
+
+tqdm.std.TqdmDefaultWriteLock.mp_lock = None
 
 #MODEL_NAME = "all-MiniLM-L6-v2"
 MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
