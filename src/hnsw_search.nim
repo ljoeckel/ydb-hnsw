@@ -56,6 +56,35 @@ proc delete(ix: HnswIndex, hit: Hit) =
     echo &"Removed {rssref} from YDB"
 
 
+proc findDuplicates(ix: HnswIndex, headline: string, k = 5) =
+    var t = newTable[string, seq[Hit]]()
+    let vec = embed(@[hnswNormalize(headline)])[0]
+
+    # collect articles that seams are related
+    for hit in ix.search(vec, k = k):
+        let sim = 1.0'f32 - hit.dist
+        if sim > 0.6:
+            t.mgetOrPut(getTitle(hit.id), @[]).add(hit)
+
+    echo headline
+
+    for title, hits in t:
+        # sanitize
+        for hit in hits:
+            let description = getDescription(hit.id)
+            let sim = 1.0'f32 - hit.dist
+            echo &"   {sim} {description}"
+            if sanitize(description):
+                echo &"EMPTY       id:{hit.id}, rssRef:{getRssRef(hit.id)}" 
+
+        var lastDescription = ""
+        for hit in hits:
+            let description = getDescription(hit.id)
+            if lastDescription != "" and description == lastDescription:
+                echo &"REDUNDANT   id:{hit.id}, rssRef:{getRssRef(hit.id)}"
+            lastDescription = description
+
+
 proc findAndRemoveDuplicates(ix: HnswIndex, headline: string, k = 5) =
     var t = newTable[string, seq[Hit]]()
     let title = hnswNormalize(headline)
@@ -68,29 +97,30 @@ proc findAndRemoveDuplicates(ix: HnswIndex, headline: string, k = 5) =
             t.mgetOrPut(getTitle(hit.id), @[]).add(hit)
      
     for title, hits in t:
-        if hits.len > 1:
-            # sanitize
-            for hit in hits:
-                let description = getDescription(hit.id)
-                if sanitize(description):
-                    echo &"EMPTY       id:{hit.id} {description}"
-                    delete(ix, hit)
+        # sanitize
+        for hit in hits:
+            let description = getDescription(hit.id)
+            if sanitize(description):
+                echo &"EMPTY       id:{hit.id} {description}"
+                delete(ix, hit)
 
-            var lastDescription = ""
-            for hit in hits:
-                let description = getDescription(hit.id)
-                if lastDescription != "" and description == lastDescription:
-                    echo &"REDUNDANT   id:{hit.id} {description}"
-                    delete(ix, hit)
-                lastDescription = description
+        var lastDescription = ""
+        for hit in hits:
+            let description = getDescription(hit.id)
+            if lastDescription != "" and description == lastDescription:
+                echo &"REDUNDANT   id:{hit.id} {description}"
+                delete(ix, hit)
+            lastDescription = description
 
 
 
 when isMainModule:
-    var ix = openHnsw(Index, M = 16, efConstruction = 200, efSearch = 64)
+    var ix = openHnsw(HnswParams(global: "^HNSWArticles"))
+    #var ix = openHnsw(Index, M = 16, efConstruction = 200, efSearch = 64)
 
-    # let t = "das naechste gaspreis hoch bei equinor klingelt die kasse weiter"
-    # let tds = findDuplicates(ix, t)
+    #let t = hnswNormalize("Anschläge auf Umspannwerke: Verband: Brauchen Backup-System für Notfälle im Stromnetz")
+    let t = hnswNormalize("Sabotage - Polizei findet zwölf Sprengsätze an Stromtrassen in Sachsen - Fahndung mit Foto nach Tatverdächtigem aus NRW")
+    findDuplicates(ix, t)
 
     # for hit in tds:
     #     if delete(ix, hit):
@@ -100,10 +130,10 @@ when isMainModule:
 
     
 
-    for (cnt, idxref, title) in enumerate(RSSItemIter()):
-        findAndRemoveDuplicates(ix, title, k=10)
-        if cnt mod 100 == 0:
-            echo cnt, " ", title
-            updateDBStats("hnsw_clean")
+    # for (cnt, idxref, title) in enumerate(RSSItemIter()):
+    #     findAndRemoveDuplicates(ix, title, k=10)
+    #     if cnt mod 100 == 0:
+    #         echo cnt, " ", title
+    #         updateDBStats("hnsw_clean")
 
-    updateDBStats("hnsw_clean")
+    # updateDBStats("hnsw_clean")

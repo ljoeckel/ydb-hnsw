@@ -85,15 +85,17 @@ type
     vqInt8Fixed ## scalar-quantized on one grid for the whole index (dim bytes)
 
   HnswParams* = object
-    globalNode*: string     ## YottaDB global ^HNSWxxxNODE
-    globalKey*: string      ## YottaDB global ^HNSWxxxKEY
-    globalMeta*: string     ## YottaDB global ^HNSWxxxMETA
-    M*: int                 ## links per node above layer 0
-    efConstruction*: int    ## candidate width while inserting
-    efSearch*: int          ## default candidate width while searching
-    seed*: int              ## RNG seed for the random level draw
-    quant*: VecQuant        ## vector storage / quantization mode
-    quantScale*: float32    ## the int8 grid for vqInt8Fixed, ignored otherwise
+    global*: string                 ## YottaDB global basename ^HNSWxxx
+    globalNode*: string             ## YottaDB global ^HNSWxxxNODE
+    globalKey*: string              ## YottaDB global ^HNSWxxxKEY
+    globalMeta*: string             ## YottaDB global ^HNSWxxxMETA
+    M*: int = 16                    ## links per node above layer 0
+    efConstruction*: int = 200      ## candidate width while inserting
+    efSearch*: int = 64             ## default candidate width while searching
+    seed*: int = 1234               ## RNG seed for the random level draw
+    dim*: int = 0                   ## Dimension
+    quant*: VecQuant = vqNone       ## vector storage / quantization mode
+    quantScale*: float32 = 0.0'f32  ## the int8 grid for vqInt8Fixed, ignored otherwise
 
   Neighbor* = tuple[dist: float32, id: int]
 
@@ -135,6 +137,8 @@ proc `<`(a, b: AscItem): bool = a.dist < b.dist
 proc `<`(a, b: DescItem): bool = a.dist > b.dist
 proc cmpNeighbor(a, b: Neighbor): int = cmp(a.dist, b.dist)
 
+proc sim*(hit: Hit): float32 =
+    1.0'f32 - hit.dist
 
 # ---------------------------------------------------------------------------
 # text normalization (dedup keys / embedding input)
@@ -542,7 +546,6 @@ proc metaGlobal*(global: string): string = global & "META"
 # ---------------------------------------------------------------------------
 # lifecycle
 # ---------------------------------------------------------------------------
-
 proc openHnsw*(global: string, M = 16, efConstruction = 200,
                efSearch = 64, seed = 1234, dim = 0, quant = vqNone,
                quantScale = 0.0'f32): HnswIndex =
@@ -595,6 +598,10 @@ proc openHnsw*(global: string, M = 16, efConstruction = 200,
   if result.params.quant == vqInt8Fixed and result.params.quantScale <= 0:
     raise newException(ValueError,
       "vqInt8Fixed needs a positive quantScale, e.g. quantizeScale(sample)")
+
+
+proc openHnsw*(p: HnswParams): HnswIndex =
+    openHnsw(p.global, p.M, p.efConstruction, p.efSearch, p.seed, p.dim, p.quant, p.quantScale)
 
 proc hasId*(ix: HnswIndex, id: int): bool =
   ## Whether a live node exists at `id`. One YottaDB `data` call, no value read.
