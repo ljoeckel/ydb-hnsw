@@ -21,6 +21,7 @@
 ##   ^HNSWxxxMETA("maxLevel")        current top layer
 ##   ^HNSWxxxMETA("quant")           vector storage mode (see below)
 ##   ^HNSWxxxMETA("qscale")          shared int8 grid, only for vqInt8Fixed
+##   ^HNSWxxxMETA("model")           embedding model the vectors come from
 ##   ^HNSWxxxNODE(id,"vec")          the L2-normalised vector, see below
 ##   ^HNSWxxxNODE(id,"level")        top layer of this node
 ##   ^HNSWxxxNODE(id,"links",layer)  neighbour ids as int64 (only if non-empty)
@@ -53,6 +54,14 @@
 ## `global` must be a legal YottaDB name: letters, digits and `%` only - no
 ## underscores (YottaDB rejects "^HNSW_ARTICLES" with %YDB-E-INVVARNAME).
 ##
+## The embedding model is named in `HnswParams.model` and pinned in META with the
+## first vector, next to the geometry: vectors of two different models cannot be
+## compared, so a reopen uses the model recorded in the index, not the one the
+## caller happens to pass. `openHnsw` hands that name to the loader the host
+## installs through `setModelLoader` (`bert_nim.loadModel` does it when it is
+## imported), which keeps this module free of Python - a program that never
+## embeds, like the tests, opens indexes without loading a model.
+##
 ## Vectors are L2-normalised on insert, which makes cosine similarity a plain
 ## dot product and cosine distance `1 - dot`. How they are then stored is
 ## configurable, per index, through `HnswParams.quant`:
@@ -77,6 +86,10 @@
 import std/[algorithm, heapqueue, math, random, sets, strutils, unicode]
 import yottadb
 
+const DefaultModel* = "paraphrase-multilingual-MiniLM-L12-v2"
+  ## The sentence-transformers model an index uses unless `HnswParams.model` -
+  ## or the "model" key of an index that already exists - names another one.
+
 type
   VecQuant* = enum
     ## How an index stores (and compares) its vectors.
@@ -84,8 +97,15 @@ type
     vqInt8      ## scalar-quantized, grid stored with each vector (4 + dim bytes)
     vqInt8Fixed ## scalar-quantized on one grid for the whole index (dim bytes)
 
+  ModelLoader* = proc(model: string): string
+    ## How `openHnsw` reaches the embedding model named in `HnswParams.model`:
+    ## load `model` and return the name it ends up loaded under. The host program
+    ## installs it with `setModelLoader` - `bert_nim.nim` does that at import
+    ## time - which is what keeps this module free of Python. A program that
+    ## never embeds (the pure-Nim tests) leaves it nil.
+
   HnswParams* = object
-    model*: string                  ## The hugging face model name
+    model*: string = DefaultModel   ## The hugging face model name
     global*: string                 ## YottaDB global basename ^HNSWxxx
     globalNode*: string             ## YottaDB global ^HNSWxxxNODE
     globalKey*: string              ## YottaDB global ^HNSWxxxKEY
@@ -547,6 +567,13 @@ proc metaGlobal*(global: string): string = global & "META"
 # ---------------------------------------------------------------------------
 # lifecycle
 # ---------------------------------------------------------------------------
+var modelLoader: ModelLoader = nil
+
+proc setModelLoader*(loader: ModelLoader) =
+  ## Install the way `openHnsw` loads the model named in `HnswParams.model` - see
+  ## `ModelLoader`. `bert_nim.loadModel` is what the embedding side registers.
+  modelLoader = loader
+
 proc deriveGlobalNames(p: var HnswParams) =
   ## Fill in the `^...NODE` / `^...KEY` / `^...META` names that belong to
   ## `p.global`, unless a caller named them itself.
@@ -554,15 +581,15 @@ proc deriveGlobalNames(p: var HnswParams) =
   if p.globalKey.len == 0: p.globalKey = p.global.keyGlobal
   if p.globalMeta.len == 0: p.globalMeta = p.global.metaGlobal
 
-proc hnswParams*(global: string, model = "", M = 16, efConstruction = 200,
-                 efSearch = 64, seed = 1234, dim = 0, quant = vqNone,
-                 quantScale = 0.0'f32): HnswParams =
+proc hnswParams*(global: string, model = DefaultModel,
+                 M = 16, efConstruction = 200, efSearch = 64, seed = 1234,
+                 dim = 0, quant = vqNone, quantScale = 0.0'f32): HnswParams =
   ## Configure one index: `global` is the YottaDB global (`^HNSWxxx`) and the
   ## `NODE` / `KEY` / `META` names are derived from it, so no caller spells the
   ## layout out a second time.
   ##
-  ## `dim`, `quant` and `quantScale` only have to be right the first time; an
-  ## index that already exists keeps what META says (see `openHnsw`).
+  ## `model`, `dim`, `quant` and `quantScale` only have to be right the first
+  ## time; an index that already exists keeps what META says (see `openHnsw`).
   result = HnswParams(global: global, model: model, M: M,
                       efConstruction: efConstruction, efSearch: efSearch,
                       seed: seed, dim: dim, quant: quant, quantScale: quantScale)
@@ -585,6 +612,12 @@ proc openHnsw*(p: HnswParams): HnswIndex =
   ## `p.quantScale` is the int8 grid for `vqInt8Fixed` - take it from
   ## `quantizeScale(sample)` over a representative sample of the collection - and
   ## is required (> 0) in that mode, ignored in the others.
+  ##
+  ## `p.model` names the sentence-transformers model the index works with, and is
+  ## the reason opening an index loads one: once META has the model (written with
+  ## the first vector), that recorded name wins and is what gets loaded, so a
+  ## reopen always embeds with the model its vectors came from. Loading goes
+  ## through `setModelLoader`; with no loader installed the name is only carried.
   new(result)
   result.params = p
   deriveGlobalNames(result.params)
@@ -615,6 +648,18 @@ proc openHnsw*(p: HnswParams): HnswIndex =
   if result.params.quant == vqInt8Fixed and result.params.quantScale <= 0:
     raise newException(ValueError,
       "vqInt8Fixed needs a positive quantScale, e.g. quantizeScale(sample)")
+
+  # The embedding model belongs to the index's identity, like its dimension and
+  # its storage mode: a vector is only comparable to one from the same model, so
+  # META wins over `p` and a reopen loads the model the vectors were built with.
+  # The load happens here, at the end, so a config error above fails before the
+  # weights are pulled in. Without a loader (see `setModelLoader`) the name is
+  # carried along but nothing is loaded - the tests never import Python.
+  result.params.model = result.metaGetName("model", p.model)
+  if result.params.model.len > 0 and not modelLoader.isNil:
+    # The loader reports back the name it resolved to (a short id, a local path,
+    # the default) - that resolved name is what the index is described by.
+    result.params.model = modelLoader(result.params.model)
 
 
 proc hasId*(ix: HnswIndex, id: int): bool =
@@ -803,13 +848,16 @@ proc add*(ix: HnswIndex, vec: openArray[float32], key = ""): int =
   # Persist the geometry with the first node: the graph is only valid for the M
   # and efConstruction it was built with, so a later open() must not be able to
   # change them (openHnsw prefers whatever the database already holds). Same for
-  # the storage mode, which decides how every vector blob in the index decodes.
+  # the storage mode, which decides how every vector blob in the index decodes,
+  # and for the embedding model, which decides what the vectors mean.
   if ix.count == 0:
     ix.metaSet("M", $ix.params.M)
     ix.metaSet("efConstruction", $ix.params.efConstruction)
     ix.metaSet("quant", $ix.params.quant)
     if ix.params.quant == vqInt8Fixed:
       ix.metaSet("qscale", $ix.params.quantScale)
+    if ix.params.model.len > 0:
+      ix.metaSet("model", ix.params.model)
 
   # The node's own data first: later steps look their neighbours up by id.
   ix.putVec(id, sv)

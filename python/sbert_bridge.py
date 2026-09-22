@@ -1,9 +1,10 @@
 """Bridge between the Python/SBERT pipeline and Nim (see `bert_nim.nim`).
 
-The Nim side imports this module with nimpy and calls `embed()` or
-`embed_numpy()` / `query()`. Keep the public API here small and boring - it is
-the contract that crosses the language boundary, so renaming things breaks the
-Nim build (see `bert_nim.nim`).
+The Nim side imports this module with nimpy, then loads a model with `load()` -
+which happens when `openHnsw()` opens an index, from `HnswParams.model` (see
+`hnsw.nim`) - and after that calls `embed()` / `embed_numpy()` / `query()`.
+Keep the public API here small and boring - it is the contract that crosses the
+language boundary, so renaming things breaks the Nim build (see `bert_nim.nim`).
 """
 
 import os
@@ -75,17 +76,47 @@ import tqdm.std
 
 tqdm.std.TqdmDefaultWriteLock.mp_lock = None
 
-#MODEL_NAME = "all-MiniLM-L6-v2"
-MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+# The model is deliberately *not* loaded here: the Nim side names it in
+# `HnswParams.model` and loads it through `load()` when the index is opened, so
+# which model an index holds is decided per index (and recorded in the index's
+# META) instead of being baked into this module.
+_model = None         # the SentenceTransformer, once load() has run
+_model_name = None    # the name it was loaded under, None before that
 
-# Loaded once at import time, so every call coming from Nim reuses the weights.
-model = SentenceTransformer(MODEL_NAME)
+
+def load(model_name: str) -> str:
+    """Load the sentence-transformers model `model_name`; return the name used.
+
+    Called once per index open, so loading the same name again is a no-op: the
+    weights are already resident and every call coming from Nim reuses them.
+    Loading a *different* name replaces the model - vectors are only comparable
+    to vectors from the same model, which is why an index pins its model in META
+    the way it pins its dimension and storage mode.
+    """
+    global _model, _model_name
+    if _model is None or model_name != _model_name:
+        _model = SentenceTransformer(model_name)
+        _model_name = model_name
+    return _model_name
+
+
+def model_name() -> str:
+    """Name the model was loaded under, or "" while nothing is loaded."""
+    return _model_name or ""
+
+
+def _loaded():
+    if _model is None:
+        raise RuntimeError(
+            "no embedding model loaded - set HnswParams.model and open the "
+            "index first (openHnsw loads it), or call sbert_bridge.load(name)")
+    return _model
 
 
 def dim() -> int:
-    """Embedding size of the loaded model (384 for all-MiniLM-L6-v2)."""
+    """Embedding size of the loaded model (384 for the MiniLM models)."""
     # Renamed in sentence-transformers 6; this env is pinned to 6.0.1.
-    return int(model.get_embedding_dimension())
+    return int(_loaded().get_embedding_dimension())
 
 
 def embed(texts) -> list[list[float]]:
@@ -94,7 +125,7 @@ def embed(texts) -> list[list[float]]:
     Returning plain lists keeps the nimpy conversion trivial on the Nim side:
     `bridge.embed(texts).to(seq[seq[float32]])`.
     """
-    vectors = model.encode(list(texts), convert_to_numpy=True)
+    vectors = _loaded().encode(list(texts), convert_to_numpy=True)
     return vectors.tolist()
 
 
@@ -104,7 +135,7 @@ def embed_numpy(texts):
     Preferred for larger batches: the Nim side reads the buffer directly via
     nimpy's `raw_buffers`, so no Python float object is built per element.
     """
-    vectors = model.encode(list(texts), convert_to_numpy=True)
+    vectors = _loaded().encode(list(texts), convert_to_numpy=True)
     return np.ascontiguousarray(vectors, dtype=np.float32)
 
 

@@ -24,6 +24,11 @@ let bridge = bakery.bridge
 when isMainModule:
   import std/[strformat, strutils]    
 
+  # This demo never opens an HNSW index, so no `openHnsw` loads a model for it:
+  # name it here (the empty argument means `DefaultModel`). `dim()` below needs a
+  # loaded model, and so do embed()/embedFlat().
+  echo &"model: {loadModel()}"
+
   # Embedding size of the loaded model, asked from Python (384 for MiniLM-L6).
   let dim = bridge.dim().to(int)
 

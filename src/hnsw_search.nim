@@ -72,6 +72,8 @@ when isMainModule:
         titles.add(hnswNormalize(title))
     echo &"Have {titles.len} titles"
 
+    # The index this program cleans; `openHnsw` loads the model named here (and
+    # for an index that already has vectors, the one recorded in its META).
     let params = hnswParams("^HNSWArticles")
     echo &"Opening the HNSW index with {params}"
 

@@ -11,12 +11,32 @@
 ## site-packages are supplied through PYTHONPATH.
 
 import bakery
+import hnsw         # `ModelLoader`: what openHnsw calls back for the model
 import nimpy
 import nimpy/raw_buffers   # for the zero-copy numpy path
 
 # bakery registers this in sys.modules at init; take the module from there
 # rather than pyImport("sbert_bridge"), so the import is a real dependency.
 let bridge = bakery.bridge
+
+
+proc loadModel*(name: string = hnsw.DefaultModel): string =
+  ## Load the sentence-transformers model `name` (empty means `DefaultModel`) and
+  ## return the name it is loaded under.
+  ##
+  ## `openHnsw` calls this through `hnsw.setModelLoader`, so `HnswParams.model`
+  ## decides which weights an index embeds with - and META decides for an index
+  ## that already has vectors. A program that embeds without opening an index
+  ## calls it directly (see `examples/bert_demo.nim`).
+  ##
+  ## Loading is idempotent per name: the same name keeps the model already in
+  ## memory, a different one replaces it.
+  bridge.load(if name.len == 0: hnsw.DefaultModel else: name).to(string)
+
+
+# hnsw must not depend on Python, so the way back is registered here: every
+# `openHnsw` that names a model lands in `loadModel` above.
+hnsw.setModelLoader(loadModel)
 
 
 proc embed*(texts: seq[string]): seq[seq[float32]] =

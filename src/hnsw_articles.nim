@@ -28,6 +28,9 @@ usage: hnsw_articles [option=value]...
                    letters, digits and % only - no underscores.
   --quant=MODE     none | int8 | int8fixed (default none, i.e. float32).
                    An index keeps the mode of its first vector.
+  --model=NAME     sentence-transformers model the vectors are built with.
+                   Default """ & DefaultModel & """ - an index keeps the model
+                   of its first vector, because vectors of two models do not mix.
   --scale=FLOAT    int8 grid for --quant=int8fixed. "auto" (the default in that
                    mode) derives it from --sample real embeddings.
   --sample=N       titles embedded to derive that grid (default 5000).
@@ -45,6 +48,8 @@ type
         index: string
         quant: VecQuant
         quantGiven: bool
+        model: string
+        modelGiven: bool
         scale: float32
         scaleAuto: bool
         reset: bool
@@ -64,6 +69,7 @@ proc parseArgs(): Options =
     result.limit = int.high
     result.sample = 5000
     result.scaleAuto = true
+    result.model = DefaultModel
     for i in 1 .. paramCount():
         let a = paramStr(i)
         let eq = a.find('=')
@@ -73,6 +79,10 @@ proc parseArgs(): Options =
         of "--index":
             if val.len == 0: quit "--index needs a global name, e.g. --index=^HNSWQ", 2
             result.index = val
+        of "--model":
+            if val.len == 0: quit "--model needs a name, e.g. --model=all-MiniLM-L6-v2", 2
+            result.model = val
+            result.modelGiven = true
         of "--quant":
             result.quant = parseMode(val)
             result.quantGiven = true
@@ -121,10 +131,12 @@ when isMainModule:
              &"alongside it as --index={DefaultIndex}Q", 2
 
     # Graph parameters are fixed for this program; the command line only picks
-    # the index, the storage mode and the grid. `hnswParams` derives the
-    # `^...NODE/KEY/META` names, so `dropIndex` and `openHnsw` (and the KEY- and
-    # NODE-side helpers below) all address the same globals.
-    var params = hnswParams(opts.index, M = 16, efConstruction = 200, efSearch = 64,
+    # the index, the embedding model, the storage mode and the grid. `hnswParams`
+    # derives the `^...NODE/KEY/META` names, so `dropIndex` and `openHnsw` (and
+    # the KEY- and NODE-side helpers below) all address the same globals, and
+    # `openHnsw` loads `params.model` (see `bert_nim.loadModel`).
+    var params = hnswParams(opts.index, model = opts.model,
+                            M = 16, efConstruction = 200, efSearch = 64,
                             quant = opts.quant, quantScale = opts.scale)
 
     if opts.reset:
@@ -164,8 +176,11 @@ when isMainModule:
        ix.params.quantScale != opts.scale:
         echo &"note: {opts.index} keeps its grid {ix.params.quantScale:.8f}, " &
              &"not --scale={opts.scale:.8f}"
+    if opts.modelGiven and ix.params.model.len > 0 and ix.params.model != opts.model:
+        echo &"note: {opts.index} holds vectors of {ix.params.model} and keeps that " &
+             &"model, not --model={opts.model}"
 
-    echo &"{opts.index}: {ix.params.quant}, {ix.liveCount} nodes" &
+    echo &"{opts.index}: {ix.params.model}, {ix.params.quant}, {ix.liveCount} nodes" &
          (if ix.dim > 0: &", dim {ix.dim}, {bytesPerVector(ix)} B/vector" else: "")
 
     let started = epochTime()
