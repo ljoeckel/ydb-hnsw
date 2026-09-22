@@ -88,9 +88,10 @@ proc parseArgs(): Options =
         of "--help", "-h": result.help = true
         else: quit &"unknown option {a} - try --help", 2
 
-proc dropIndex(global: string) =
-    ## `--reset`: the three globals of one index, and nothing else.
-    for g in [global.nodeGlobal, global.keyGlobal, global.metaGlobal]:
+proc dropIndex(params: HnswParams) =
+    ## `--reset`: the three globals of one index, and nothing else. The names
+    ## come from the params, so they cannot drift from the ones `openHnsw` uses.
+    for g in [params.globalNode, params.globalKey, params.globalMeta]:
         ydb_delete(g, @[], YDB_DEL_TREE)
 
 proc bytesPerVector(ix: HnswIndex): int =
@@ -119,14 +120,20 @@ when isMainModule:
              &"index - name a target explicitly (--index=...), or build the new one " &
              &"alongside it as --index={DefaultIndex}Q", 2
 
+    # Graph parameters are fixed for this program; the command line only picks
+    # the index, the storage mode and the grid. `hnswParams` derives the
+    # `^...NODE/KEY/META` names, so `dropIndex` and `openHnsw` (and the KEY- and
+    # NODE-side helpers below) all address the same globals.
+    var params = hnswParams(opts.index, M = 16, efConstruction = 200, efSearch = 64,
+                            quant = opts.quant, quantScale = opts.scale)
+
     if opts.reset:
-        dropIndex(opts.index)
+        dropIndex(params)
         echo &"deleted {opts.index} (NODE/KEY/META)"
 
     var ix: HnswIndex
     try:
-        ix = openHnsw(opts.index, M = 16, efConstruction = 200, efSearch = 64,
-                      quant = opts.quant, quantScale = opts.scale)
+        ix = openHnsw(params)
     except ValueError as e:
         # vqInt8Fixed with neither --scale nor a grid in META: openHnsw refuses,
         # because a grid has to exist before the first vector is written. Measure
@@ -143,8 +150,8 @@ when isMainModule:
         let grid = quantizeScale(sample)
         echo &"grid from {sample.len} sample titles: {grid:.8f} " &
              &"({epochTime() - sampleStart:.1f} s)"
-        ix = openHnsw(opts.index, M = 16, efConstruction = 200, efSearch = 64,
-                      quant = opts.quant, quantScale = grid)
+        params.quantScale = grid
+        ix = openHnsw(params)
 
     # A non-empty index keeps the mode (and the grid) of its first vector. Say so
     # rather than quietly building more of the same kind - "I asked for int8 and

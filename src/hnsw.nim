@@ -55,7 +55,7 @@
 ##
 ## Vectors are L2-normalised on insert, which makes cosine similarity a plain
 ## dot product and cosine distance `1 - dot`. How they are then stored is
-## configurable, per index, through `openHnsw(..., quant = ...)`:
+## configurable, per index, through `HnswParams.quant`:
 ##
 ##   vqNone       4 * dim bytes - the float32 vector as-is (default)
 ##   vqInt8       4 + dim bytes - float32 scale, then one int8 code per dimension
@@ -547,37 +547,53 @@ proc metaGlobal*(global: string): string = global & "META"
 # ---------------------------------------------------------------------------
 # lifecycle
 # ---------------------------------------------------------------------------
-proc openHnsw*(global: string, M = 16, efConstruction = 200,
-               efSearch = 64, seed = 1234, dim = 0, quant = vqNone,
-               quantScale = 0.0'f32): HnswIndex =
-  ## Open (or create) an index stored in `global`.
+proc deriveGlobalNames(p: var HnswParams) =
+  ## Fill in the `^...NODE` / `^...KEY` / `^...META` names that belong to
+  ## `p.global`, unless a caller named them itself.
+  if p.globalNode.len == 0: p.globalNode = p.global.nodeGlobal
+  if p.globalKey.len == 0: p.globalKey = p.global.keyGlobal
+  if p.globalMeta.len == 0: p.globalMeta = p.global.metaGlobal
+
+proc hnswParams*(global: string, model = "", M = 16, efConstruction = 200,
+                 efSearch = 64, seed = 1234, dim = 0, quant = vqNone,
+                 quantScale = 0.0'f32): HnswParams =
+  ## Configure one index: `global` is the YottaDB global (`^HNSWxxx`) and the
+  ## `NODE` / `KEY` / `META` names are derived from it, so no caller spells the
+  ## layout out a second time.
   ##
-  ## `dim`, `quant` and `quantScale` only have to be passed the first time;
-  ## afterwards they are read back from YottaDB. Params already in the database
-  ## win over the arguments, so reopening an index cannot silently change its
-  ## geometry or reinterpret its stored vectors.
+  ## `dim`, `quant` and `quantScale` only have to be right the first time; an
+  ## index that already exists keeps what META says (see `openHnsw`).
+  result = HnswParams(global: global, model: model, M: M,
+                      efConstruction: efConstruction, efSearch: efSearch,
+                      seed: seed, dim: dim, quant: quant, quantScale: quantScale)
+  deriveGlobalNames(result)
+
+proc openHnsw*(p: HnswParams): HnswIndex =
+  ## Open (or create) the index described by `p` - the single way in, whether the
+  ## params come from `hnswParams(...)` or are written out as an `HnswParams`.
+  ##
+  ## Params already in the database win over `p`, so reopening an index cannot
+  ## silently change its geometry or reinterpret its stored vectors: `M`,
+  ## `efConstruction`, `dim`, `quant` and `quantScale` are read back from META,
+  ## and `p` only supplies them for an index that does not have them yet.
   ##
   ## The mode of a non-empty index is whatever META says: an index with vectors
-  ## but no "quant" key predates quantization and is `vqNone` no matter what is
-  ## passed here, because its blobs are float32 and reading them as codes would
-  ## be silent nonsense. Changing modes means rebuilding into a new global.
+  ## but no "quant" key predates quantization and is `vqNone` no matter what `p`
+  ## says, because its blobs are float32 and reading them as codes would be
+  ## silent nonsense. Changing modes means rebuilding into a new global.
   ##
-  ## `quantScale` is the int8 grid for `vqInt8Fixed` - take it from
+  ## `p.quantScale` is the int8 grid for `vqInt8Fixed` - take it from
   ## `quantizeScale(sample)` over a representative sample of the collection - and
   ## is required (> 0) in that mode, ignored in the others.
   new(result)
-  result.params = HnswParams(globalNode: global.nodeGlobal,
-                             globalKey: global.keyGlobal,
-                             globalMeta: global.metaGlobal,
-                             M: M,
-                             efConstruction: efConstruction,
-                             efSearch: efSearch, seed: seed)
-  result.rng = initRand(seed)
+  result.params = p
+  deriveGlobalNames(result.params)
+  result.rng = initRand(result.params.seed)
   result.entry = -1
 
-  result.params.M = result.metaGet("M", M)
-  result.params.efConstruction = result.metaGet("efConstruction", efConstruction)
-  result.dim = result.metaGet("dim", dim)
+  result.params.M = result.metaGet("M", p.M)
+  result.params.efConstruction = result.metaGet("efConstruction", p.efConstruction)
+  result.dim = result.metaGet("dim", p.dim)
   result.count = result.metaGet("count", 0)
   # Indexes written before deletion existed have no "live" key; for those every
   # allocated id is still present.
@@ -593,16 +609,13 @@ proc openHnsw*(global: string, M = 16, efConstruction = 200,
     # Non-empty and no "quant" key: written before quantization existed.
     result.params.quant = vqNone
   else:
-    result.params.quant = quant
-  result.params.quantScale = result.metaGetFloat("qscale", quantScale)
+    result.params.quant = p.quant
+  result.params.quantScale = result.metaGetFloat("qscale", p.quantScale)
 
   if result.params.quant == vqInt8Fixed and result.params.quantScale <= 0:
     raise newException(ValueError,
       "vqInt8Fixed needs a positive quantScale, e.g. quantizeScale(sample)")
 
-
-proc openHnsw*(p: HnswParams): HnswIndex =
-    openHnsw(p.global, p.M, p.efConstruction, p.efSearch, p.seed, p.dim, p.quant, p.quantScale)
 
 proc hasId*(ix: HnswIndex, id: int): bool =
   ## Whether a live node exists at `id`. One YottaDB `data` call, no value read.

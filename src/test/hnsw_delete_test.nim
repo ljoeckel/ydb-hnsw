@@ -44,7 +44,12 @@ proc levelOfRaw(ix: HnswIndex, id: int): int =
   parseInt(ydb_get(ix.params.globalNode, @[$id, "level"]))
 
 when isMainModule:
-  for g in [Global.nodeGlobal, Global.keyGlobal, Global.metaGlobal]:
+  # The scratch index this test works on, configured once: `hnswParams` derives
+  # the ^...NODE/KEY/META names, so the cleanups below, the three opens and the
+  # raw NODE access in the helpers all address the same globals.
+  let params = hnswParams(Global, M = 8, efConstruction = 32, efSearch = 64)
+
+  for g in [params.globalNode, params.globalKey, params.globalMeta]:
     ydb_delete(g, @[], YDB_DEL_TREE)
 
   var rng = initRand(42)
@@ -55,7 +60,7 @@ when isMainModule:
       v[d] = rand(rng, 2.0'f32) - 1.0'f32
     vecs.add v
 
-  var ix = openHnsw(Global, M = 8, efConstruction = 32, efSearch = 64)
+  var ix = openHnsw(params)
   for i in 0 ..< N:
     discard ix.add(vecs[i], key = "k" & $i)
 
@@ -102,8 +107,8 @@ when isMainModule:
   # --- stale bookkeeping: point META at a deleted node and reopen ------------
   # This is the "search suddenly returns nothing" failure a crashed or
   # interrupted delete can leave behind.
-  ydb_set(Global.metaGlobal, @["entry"], "2")        # 2 was deleted above
-  var ix2 = openHnsw(Global, M = 8, efConstruction = 32, efSearch = 64)
+  ydb_set(params.globalMeta, @["entry"], "2")        # 2 was deleted above
+  var ix2 = openHnsw(params)
   echo &"reopened with entry={ix2.entry} (deleted): search -> ",
        ix2.search(vecs[1], k = 1).len, " hits"
   echo "repair() : ", ix2.repair(), " layer(s) relinked -> entry=", ix2.entry
@@ -128,9 +133,9 @@ when isMainModule:
   # --- delete-time repair: neighbour whose *only* link is the deleted node ----
   # (a fresh index, so this does not depend on how the graph above happened to
   # come out; nodes 0 and 1 are wired to point at each other only)
-  for g in [Global.nodeGlobal, Global.keyGlobal, Global.metaGlobal]:
+  for g in [params.globalNode, params.globalKey, params.globalMeta]:
     ydb_delete(g, @[], YDB_DEL_TREE)
-  var ix3 = openHnsw(Global, M = 8, efConstruction = 32, efSearch = 64)
+  var ix3 = openHnsw(params)
   for i in 0 ..< 6:
     discard ix3.add(vecs[i], key = "n" & $i)
   writeLinks(ix3, 0, 0, @[1])          # node 0's only link is node 1
@@ -140,6 +145,6 @@ when isMainModule:
   echo &"after deleting node 1: node 0 L0 links = {readLinks(ix3, 0, 0)} " &
        &"(re-linked by delete itself)"
 
-  for g in [Global.nodeGlobal, Global.keyGlobal, Global.metaGlobal]:
+  for g in [params.globalNode, params.globalKey, params.globalMeta]:
     ydb_delete(g, @[], YDB_DEL_TREE)
   echo "scratch globals cleaned up"

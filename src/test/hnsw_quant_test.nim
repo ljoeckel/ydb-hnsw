@@ -257,8 +257,9 @@ when isMainModule:
     for mode in [vqNone, vqInt8, vqInt8Fixed]:
       resetIndex(ScratchGlobal)
       let buildStart = cpuTime()
-      var ix = openHnsw(ScratchGlobal, M = 16, efConstruction = 100,
-                        efSearch = 64, dim = Dim, quant = mode, quantScale = grid)
+      var ix = openHnsw(hnswParams(ScratchGlobal, M = 16, efConstruction = 100,
+                                   efSearch = 64, dim = Dim, quant = mode,
+                                   quantScale = grid))
       for v in indexVecs:
         discard ix.add(v)
       let buildMs = (cpuTime() - buildStart) * 1000.0
@@ -278,9 +279,10 @@ when isMainModule:
 
       # The mode must come back from META, not from the arguments - also when the
       # argument contradicts what is on disk.
-      let reopened = openHnsw(ScratchGlobal, quant = vqNone)
-      let contested = openHnsw(ScratchGlobal,
-                               quant = if mode == vqNone: vqInt8 else: vqNone)
+      let reopened = openHnsw(HnswParams(global: ScratchGlobal, quant: vqNone))
+      let contested = openHnsw(
+        HnswParams(global: ScratchGlobal,
+                   quant: if mode == vqNone: vqInt8 else: vqNone))
 
       echo &"\n[{mode}] count={ix.count} live={ix.liveCount} " &
            &"{float(vecBytes(ix)) / float(IndexN):.1f} B/vector stored " &
@@ -292,8 +294,8 @@ when isMainModule:
 
     # A grid that is too small has to be visible, not silently lossy.
     resetIndex(TightGlobal)
-    var tight = openHnsw(TightGlobal, dim = Dim, quant = vqInt8Fixed,
-                         quantScale = grid / 10.0'f32)
+    var tight = openHnsw(hnswParams(TightGlobal, dim = Dim, quant = vqInt8Fixed,
+                                    quantScale = grid / 10.0'f32))
     for v in indexVecs[0 ..< 20]:
       discard tight.add(v)
     echo &"\n=== too-small grid ({grid / 10.0'f32:.8f} instead of {grid:.8f}) ==="
@@ -301,7 +303,7 @@ when isMainModule:
     resetIndex(TightGlobal)
 
     # A stray argument must not reinterpret an existing index.
-    let real = openHnsw(Global, quant = vqInt8, quantScale = grid)
+    let real = openHnsw(hnswParams(Global, quant = vqInt8, quantScale = grid))
     echo &"\n=== legacy guard ===\n  openHnsw({Global}, quant = vqInt8) -> " &
          &"{real.params.quant} (must stay vqNone)"
 
