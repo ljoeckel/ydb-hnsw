@@ -7,3 +7,4 @@ src/__pycache__/
 hnsw_search
 hnsw_articles
 hnsw_clean
+python/__pycache__/

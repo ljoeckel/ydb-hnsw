@@ -1,23 +1,34 @@
 ## Call the Python sentence-transformers pipeline from Nim, via nimpy.
 ##
 ## Build:  nimble build
-## Run:    nimble runNim          (sets PYTHONPATH to the venv, see bert.nimble)
-##   or:   PYTHONPATH=/home/ljoeckel/hnsw_env/lib/python3.12/site-packages ./bert_nim
+## Run:    nimble runNim          (sets PYTHONPATH to the venv, see ydbhnsw.nimble)
+##   or:   PYTHONPATH=/home/ljoeckel/git/ydb-hnsw/hnsw_env/lib/python3.12/site-packages ./bert_nim
 ##
 ## nimpy embeds a CPython interpreter into this binary (it dlopens libpython at
 ## runtime), so this process *becomes* a Python host. Everything the Python code
 ## needs - sentence_transformers, numpy, torch - must be importable by that
 ## interpreter. Since we embed the system libpython3.12, the venv's
 ## site-packages are supplied through PYTHONPATH.
+##
+## `python/sbert_bridge.py` is imported as the ordinary Python module
+## `sbert_bridge` (see below), so it stays a real file: changing it takes a
+## restart of the binary, not a rebuild.
 
-import bakery
+import std/os
+
 import hnsw         # `ModelLoader`: what openHnsw calls back for the model
 import nimpy
 import nimpy/raw_buffers   # for the zero-copy numpy path
 
-# bakery registers this in sys.modules at init; take the module from there
-# rather than pyImport("sbert_bridge"), so the import is a real dependency.
-let bridge = bakery.bridge
+# The bridge is imported from disk like any other Python module - no source is
+# baked into the binary. Its directory goes on sys.path first, so neither the
+# working directory nor PYTHONPATH has to name it; the path is resolved at
+# compile time (absolute, independent of where the binary is started from), the
+# same way a deployed binary would ship the .py next to itself.
+const bridgeDir = currentSourcePath().parentDir.parentDir / "python"
+discard pyImport("sys").path.insert(0, bridgeDir)
+
+let bridge = pyImport("sbert_bridge")
 
 
 proc loadModel*(name: string = hnsw.DefaultModel): string =
@@ -37,6 +48,13 @@ proc loadModel*(name: string = hnsw.DefaultModel): string =
 # hnsw must not depend on Python, so the way back is registered here: every
 # `openHnsw` that names a model lands in `loadModel` above.
 hnsw.setModelLoader(loadModel)
+
+
+proc dim*(): int =
+  ## Embedding size of the loaded model (384 for the MiniLM models), asked from
+  ## Python. Needs a loaded model: `openHnsw` loads one, `loadModel` does it on
+  ## request, and `sbert_bridge` raises a clear error if neither has happened.
+  bridge.dim().to(int)
 
 
 proc embed*(texts: seq[string]): seq[seq[float32]] =

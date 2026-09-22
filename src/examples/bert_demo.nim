@@ -1,8 +1,8 @@
 ## Call the Python sentence-transformers pipeline from Nim, via nimpy.
 ##
 ## Build:  nimble build
-## Run:    nimble runNim          (sets PYTHONPATH to the venv, see bert.nimble)
-##   or:   PYTHONPATH=/home/ljoeckel/hnsw_env/lib/python3.12/site-packages ./bert_nim
+## Run:    nimble runNim          (sets PYTHONPATH to the venv, see ydbhnsw.nimble)
+##   or:   PYTHONPATH=/home/ljoeckel/git/ydb-hnsw/hnsw_env/lib/python3.12/site-packages ./bert_nim
 ##
 ## nimpy embeds a CPython interpreter into this binary (it dlopens libpython at
 ## runtime), so this process *becomes* a Python host. Everything the Python code
@@ -10,15 +10,9 @@
 ## interpreter. Since we embed the system libpython3.12, the venv's
 ## site-packages are supplied through PYTHONPATH.
 
-#import bakery
 import ../ydbhnsw
 
 import nimpy
-import nimpy/raw_buffers   # for the zero-copy numpy path
-
-# bakery registers this in sys.modules at init; take the module from there
-# rather than pyImport("sbert_bridge"), so the import is a real dependency.
-let bridge = bakery.bridge
 
 
 when isMainModule:
@@ -30,7 +24,7 @@ when isMainModule:
   echo &"model: {loadModel()}"
 
   # Embedding size of the loaded model, asked from Python (384 for MiniLM-L6).
-  let dim = bridge.dim().to(int)
+  let embeddingDim = dim()
 
   let texts = @[
     "MacMini has a M4 chip",
@@ -51,7 +45,8 @@ when isMainModule:
     "MacMini has doubled price due to memory shortness",
   ]
 
-  echo &"python {pyImport(\"sys\").version.to(string).split(chr(10))[0]}, embedding dim = {dim}"
+  echo &"python {pyImport(\"sys\").version.to(string).split(chr(10))[0]}, " &
+       &"embedding dim = {embeddingDim}"
 
   # Both article groups make up one corpus. Row i of `vectors` has to line up
   # with allTexts[i]; indexing into `texts` alone breaks as soon as `texts2`
@@ -70,11 +65,11 @@ when isMainModule:
 
   # --- fast path: flat float32 buffer --------------------------------------
   let flat = embedFlat(texts)
-  echo &"embedFlat: {flat.len} float32 values ({flat.len div dim} rows)"
+  echo &"embedFlat: {flat.len} float32 values ({flat.len div embeddingDim} rows)"
 
   # Sanity check: both paths must produce the same first vector.
   var dot: float64
-  for j in 0 ..< dim:
+  for j in 0 ..< embeddingDim:
     dot += float64(flat[j]) * float64(vectors[0][j])
   echo &"sanity: dot(list[0], flat[0]) = {dot:.6f}  (expected ~1.0)"
 
