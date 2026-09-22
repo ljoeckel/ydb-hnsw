@@ -85,6 +85,7 @@ type
     vqInt8Fixed ## scalar-quantized on one grid for the whole index (dim bytes)
 
   HnswParams* = object
+    model*: string                  ## The hugging face model name
     global*: string                 ## YottaDB global basename ^HNSWxxx
     globalNode*: string             ## YottaDB global ^HNSWxxxNODE
     globalKey*: string              ## YottaDB global ^HNSWxxxKEY

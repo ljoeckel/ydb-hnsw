@@ -48,69 +48,36 @@ proc delete(ix: HnswIndex, hit: Hit) =
     if not rc:
         echo &"Could not delete {hit.id} from HNSW index"
         return
-    else:
-        echo &"Removed {hit.id} from HNSW index"
 
     # Remove from YottaDB
     deleteObject[RSSItem](rssref)
-    echo &"Removed {rssref} from YDB"
 
 
-proc findDuplicates(ix: HnswIndex, vec: seq[float32], k = 5) =
+proc findDuplicates(ix: HnswIndex, vec: seq[float32], k = 5, remove = false) =
     var t = newTable[string, seq[Hit]]()
 
     # collect articles that seams are related
     for hit in ix.search(vec, k = k):
-        let sim = 1.0'f32 - hit.dist
-        if sim > 0.6:
+        if hit.sim() > 0.6:
             t.mgetOrPut(getTitle(hit.id), @[]).add(hit)
-
-    #echo headline
 
     for title, hits in t:
         # sanitize
         for hit in hits:
             let description = getDescription(hit.id)
-            let sim = 1.0'f32 - hit.dist
-            #echo &"   {sim} {description}"
-            if sanitize(description):
+            if remove and sanitize(description):
                 inc empty
-                #echo &"EMPTY       id:{hit.id}, rssRef:{getRssRef(hit.id)}" 
+                echo &"EMPTY       id:{hit.id}, rssRef:{getRssRef(hit.id)}  {title}"
+                delete(ix, hit)
                 discard
 
         var lastDescription = ""
         for hit in hits:
             let description = getDescription(hit.id)
-            if lastDescription != "" and description == lastDescription:
-                #echo &"REDUNDANT   id:{hit.id}, rssRef:{getRssRef(hit.id)}"
+            if remove and lastDescription != "" and description == lastDescription:
+                echo &"REDUNDANT   id:{hit.id}, rssRef:{getRssRef(hit.id)} {title}"
+                echo &"            {description}"
                 inc duplicates
-            lastDescription = description
-
-
-proc findAndRemoveDuplicates(ix: HnswIndex, headline: string, k = 5) =
-    var t = newTable[string, seq[Hit]]()
-    let title = hnswNormalize(headline)
-    let q = embed(@[title])[0]
-
-    # collect articles that seams are related
-    for hit in ix.search(q, k = k):
-        let sim = 1.0'f32 - hit.dist
-        if sim > 0.6:
-            t.mgetOrPut(getTitle(hit.id), @[]).add(hit)
-     
-    for title, hits in t:
-        # sanitize
-        for hit in hits:
-            let description = getDescription(hit.id)
-            if sanitize(description):
-                echo &"EMPTY       id:{hit.id} {description}"
-                delete(ix, hit)
-
-        var lastDescription = ""
-        for hit in hits:
-            let description = getDescription(hit.id)
-            if lastDescription != "" and description == lastDescription:
-                echo &"REDUNDANT   id:{hit.id} {description}"
                 delete(ix, hit)
             lastDescription = description
 
@@ -147,12 +114,11 @@ when isMainModule:
         titles.add(hnswNormalize(title))
     echo &"Have {titles.len} titles"
 
-    #let params = HnswParams(global: "^HNSWArticles")
-    let params = HnswParams(global: "^HNSWArticlesQ", quant: vqInt8)
+    let params = HnswParams(global: "^HNSWArticles")
+    #let params = HnswParams(global: "^HNSWArticlesQ", quant: vqInt8)
     echo &"Opening the HNSW index with {params}"
 
     var ix = openHnsw(params)
-    echo ix.levelsSummary()
 
     for start in countup(0, titles.len - 1, BatchSize):
         let stop = min(start + BatchSize, titles.len)
@@ -160,8 +126,11 @@ when isMainModule:
         if flat.len == 0: continue
         let dim = flat.len div (stop - start)
         for i in start ..< stop:
-            findDuplicates(ix, flat[(i - start) * dim ..< (i - start + 1) * dim], k=10)
+            findDuplicates(ix, flat[(i - start) * dim ..< (i - start + 1) * dim], k=5, remove=true)
         echo stop - 1, " ", titles[stop - 1]
-
+        updateDBStats("hnsw_clean")
+    
     echo "     Empty: ", empty
     echo "Duplicates: ", duplicates
+
+    updateDBStats("hnsw_clean")
