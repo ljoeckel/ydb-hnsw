@@ -86,7 +86,8 @@
 import std/[algorithm, heapqueue, math, random, sets, strutils, unicode]
 import yottadb
 
-const DefaultModel* = "paraphrase-multilingual-MiniLM-L12-v2"
+#const DefaultModel* = "paraphrase-multilingual-MiniLM-L12-v2" # 384 dims
+const DefaultModel* = "intfloat/multilingual-e5-base"  # 768 dims
   ## The sentence-transformers model an index uses unless `HnswParams.model` -
   ## or the "model" key of an index that already exists - names another one.
 
