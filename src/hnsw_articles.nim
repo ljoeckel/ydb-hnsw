@@ -104,13 +104,13 @@ proc dropIndex(params: HnswParams) =
     for g in [params.globalNode, params.globalKey, params.globalMeta]:
         ydb_delete(g, @[], YDB_DEL_TREE)
 
-proc bytesPerVector(ix: HnswIndex): int =
-    ## What one stored vector costs, from the mode and the dimension alone - the
-    ## blobs do not have to be read back for this.
-    case ix.params.quant
-    of vqNone: 4 * ix.dim
-    of vqInt8: 4 + ix.dim
-    of vqInt8Fixed: ix.dim
+# proc bytesPerVector(ix: HnswIndex): int =
+#     ## What one stored vector costs, from the mode and the dimension alone - the
+#     ## blobs do not have to be read back for this.
+#     case ix.params.quant
+#     of vqNone: 4 * ix.dim
+#     of vqInt8: 4 + ix.dim
+#     of vqInt8Fixed: ix.dim
 
 proc embedNormalized(title: string): seq[float32] =
     ## Exactly what `add` stores: the vector of the normalised title, L2

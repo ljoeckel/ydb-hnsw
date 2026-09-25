@@ -11,6 +11,7 @@ requires "nim >= 2.2.4"
 requires "malebolgia >=1.3.2"
 requires "zippy >=0.10.20"
 requires "zstd >=0.9.0"
+requires "nimsimd >=1.3.0"      # distance kernels, enabled by -d:hnswSimd
 requires "https://github.com/ljoeckel/nimlz4.git"
 
 

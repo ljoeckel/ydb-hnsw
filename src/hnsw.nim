@@ -82,9 +82,34 @@
 ## neighbour heuristic - works on the *stored* form, so a quantized index builds
 ## its graph from the very codes it will search later. There is no second,
 ## inconsistent notion of distance.
+##
+## How fast a search is depends on two things, and they are not the same size:
+##
+##   * the distance kernel - `dot`, `dotInt8` and `normalize` run once per
+##     candidate. With `-d:hnswSimd` they use nimsimd intrinsics: measured on the
+##     384-dim article vectors, 4.1x on the float32 dot (321 -> 78 ns), 6.2x on
+##     the int8 dot (353 -> 57 ns) and 7.3x on `normalize` (1054 -> 144 ns).
+##     `--passC:"-march=native"` on its own buys nothing here: these are
+##     reductions, and gcc will not reassociate them without `-ffast-math`, so
+##     the vectorization has to be written out.
+##   * the per-candidate database round trip, which costs far more than the
+##     arithmetic it feeds: one `ydb_get` + `unpackFloats` on the article index is
+##     ~2.1 us against ~0.3 us for the scalar 384-dim dot. One query scores on the
+##     order of a thousand candidates, so ~90 % of its 4.6 ms is YottaDB reads.
+##     `HnswParams.cacheVectors` (or `preloadVectors`) mirrors the vectors into
+##     process memory - 4 * dim * count bytes, 1.4 GB for that index - and takes
+##     the query to ~0.9 ms. That is the bigger lever, and it is what lets the
+##     kernel speed matter at all.
 
 import std/[algorithm, heapqueue, math, random, sets, strutils, unicode]
 import yottadb
+
+when defined(hnswSimd):
+  # 256-bit float / 128-bit integer distance kernels. The C compiler has to
+  # target a CPU with AVX (this project passes `-mavx`), which is why it is a
+  # define and not the default: without it the scalar loops are used, and those
+  # build anywhere. Enable with `-d:hnswSimd`.
+  import nimsimd/avx
 
 const DefaultModel* = "paraphrase-multilingual-MiniLM-L12-v2" # 384 dims
 #const DefaultModel* = "intfloat/multilingual-e5-base"  # 768 dims
@@ -118,6 +143,9 @@ type
     dim*: int = 0                   ## Dimension
     quant*: VecQuant = vqNone       ## vector storage / quantization mode
     quantScale*: float32 = 0.0'f32  ## the int8 grid for vqInt8Fixed, ignored otherwise
+    cacheVectors*: bool = false     ## read every vector into memory on open, see
+                                    ## `preloadVectors`
+    batchSize*: int = 128           ## Default batch size for g.e. batchedIterator, etc.
 
   Neighbor* = tuple[dist: float32, id: int]
 
@@ -133,6 +161,18 @@ type
     codes: seq[int8]
     scale: float32
 
+  VecStore = object
+    ## Optional in-process copy of every vector in the index, see
+    ## `preloadVectors`. One flat arena indexed by `id * dim + component`, so a
+    ## lookup is arithmetic plus one copy - no per-vector seq to chase.
+    dim: int
+    floats: seq[float32]   ## vqNone: `dim` floats per id
+    codes: seq[int8]       ## quantized modes: `dim` codes per id
+    scales: seq[float32]   ## vqInt8: the per-vector scale, one per id
+    present: seq[bool]     ## whether `id` has a vector in the store
+    complete: bool         ## the store covers the whole index - only then may
+                           ## `hasId` answer from it instead of from YottaDB
+
   HnswIndex* = ref object
     params*: HnswParams
     dim*: int
@@ -145,6 +185,9 @@ type
                             ## +-127 by construction); a non-zero count there means
                             ## quantScale is too small and accuracy is leaking away
     rng: Rand
+    cache: VecStore         ## optional in-process copy of the vectors, see
+                            ## `preloadVectors`; empty means every read goes to
+                            ## YottaDB
 
   # Two orderings of the same pair, so `heapqueue` can serve as the
   # min-heap (candidates) and the max-heap (current best results).
@@ -237,6 +280,15 @@ proc hnswNormalize*(title: string): string =
 # binary encoding
 # ---------------------------------------------------------------------------
 
+proc bytesPerVector*(ix: HnswIndex): int =
+    ## What one stored vector costs, from the mode and the dimension alone - the
+    ## blobs do not have to be read back for this.
+    case ix.params.quant
+    of vqNone: 4 * ix.dim
+    of vqInt8: 4 + ix.dim
+    of vqInt8Fixed: ix.dim
+
+
 proc packFloats(xs: openArray[float32]): string =
   result = newString(xs.len * sizeof(float32))
   if xs.len > 0:
@@ -244,7 +296,7 @@ proc packFloats(xs: openArray[float32]): string =
 
 proc unpackFloats(s: string): seq[float32] =
   let n = s.len div sizeof(float32)
-  result = newSeq[float32](n)
+  result = newSeqUninit[float32](n)
   if n > 0:
     copyMem(result[0].addr, s[0].unsafeAddr, n * sizeof(float32))
 
@@ -257,34 +309,148 @@ proc packInts(xs: openArray[int]): string =
 
 proc unpackInts(s: string): seq[int] =
   let n = s.len div sizeof(int64)
-  result = newSeq[int](n)
+  result = newSeqUninit[int](n)
   if n > 0:
     let src = cast[ptr UncheckedArray[int64]](s[0].unsafeAddr)
     for i in 0 ..< n:
       result[i] = int(src[i])
 
-proc packLevel(level: int): string =
-  ## Levels are tiny; store them as text so the data is readable in `mupip
-  ## extract` / `ydb` output.
-  $level
-
 
 # ---------------------------------------------------------------------------
 # vector helpers
 # ---------------------------------------------------------------------------
+#
+# The two reductions the whole index is built on have hand-written SIMD bodies
+# under `-d:hnswSimd`. Two things are worth knowing about them:
+#
+#   * They are *not* what the compiler would have produced. These are floating
+#     point reductions, and without `-ffast-math` no compiler may reassociate
+#     them, so `-march=native` alone leaves the scalar loop untouched (measured:
+#     321 ns before and after). The parallelism has to be written down.
+#   * Doing so changes the summation order, so the last bits of a dot product
+#     move. That is fine here - the distance only decides an ordering, and the
+#     graph is built with the same kernel it is searched with - but it does mean
+#     the SIMD and scalar builds are not bit-identical.
+
+when defined(hnswSimd):
+  proc simdDotF32(pa, pb: ptr UncheckedArray[float32], n: int): float32 =
+    ## AVX dot product: 8 floats per multiply, 32 per iteration over four
+    ## independent accumulators. Four, not one, because a single `acc = acc + x*y`
+    ## chain is bound by the add's 3-cycle latency and would run at a third of the
+    ## multiply throughput; with four chains the two units stay busy.
+    var i = 0
+    var acc0 = mm256_setzero_ps()
+    var acc1 = mm256_setzero_ps()
+    var acc2 = mm256_setzero_ps()
+    var acc3 = mm256_setzero_ps()
+    while i + 32 <= n:
+      acc0 = mm256_add_ps(acc0, mm256_mul_ps(mm256_loadu_ps(pa[i].unsafeAddr),
+                                             mm256_loadu_ps(pb[i].unsafeAddr)))
+      acc1 = mm256_add_ps(acc1, mm256_mul_ps(mm256_loadu_ps(pa[i + 8].unsafeAddr),
+                                             mm256_loadu_ps(pb[i + 8].unsafeAddr)))
+      acc2 = mm256_add_ps(acc2, mm256_mul_ps(mm256_loadu_ps(pa[i + 16].unsafeAddr),
+                                             mm256_loadu_ps(pb[i + 16].unsafeAddr)))
+      acc3 = mm256_add_ps(acc3, mm256_mul_ps(mm256_loadu_ps(pa[i + 24].unsafeAddr),
+                                             mm256_loadu_ps(pb[i + 24].unsafeAddr)))
+      i += 32
+    while i + 8 <= n:
+      acc0 = mm256_add_ps(acc0, mm256_mul_ps(mm256_loadu_ps(pa[i].unsafeAddr),
+                                             mm256_loadu_ps(pb[i].unsafeAddr)))
+      i += 8
+    # 256 -> 128 -> 4 -> 1. Two `hadd` pairs reduce the 4 lanes; the store is the
+    # cheapest way back into a Nim float32 (nimsimd has no scalar extractor for
+    # `M128` without pulling in another header).
+    let acc = mm256_add_ps(mm256_add_ps(acc0, acc1), mm256_add_ps(acc2, acc3))
+    var s = mm_add_ps(mm256_castps256_ps128(acc), mm256_extractf128_ps(acc, 1))
+    s = mm_hadd_ps(s, s)
+    s = mm_hadd_ps(s, s)
+    var buf: array[4, float32]
+    mm_storeu_ps(buf[0].addr, s)
+    result = buf[0]
+    while i < n:
+      result += pa[i] * pb[i]
+      inc i
+
+  proc simdDotI8(pa, pb: ptr UncheckedArray[int8], n: int): int32 =
+    ## int8 dot product in 128-bit integer SIMD. This machine has AVX but not
+    ## AVX2, so there is no 256-bit integer path to take - but 128 bits still
+    ## beats scalar by a wide margin: `pmovsxbw` widens 8 bytes to int16 and
+    ## `pmaddwd` folds 8 products into 4 int32, so 16 components go through per
+    ## iteration. The accumulators stay exact int32.
+    var i = 0
+    var acc0 = mm_setzero_si128()
+    var acc1 = mm_setzero_si128()
+    while i + 16 <= n:
+      let a0 = mm_loadu_si128(pa[i].unsafeAddr)
+      let b0 = mm_loadu_si128(pb[i].unsafeAddr)
+      acc0 = mm_add_epi32(acc0, mm_madd_epi16(mm_cvtepi8_epi16(a0),
+                                              mm_cvtepi8_epi16(b0)))
+      # `cvtepi8_epi16` sign-extends the *low* 8 bytes, so the upper half has to
+      # be shifted down first. Both operands are shifted the same way, which is
+      # what keeps the pair alignment `pmaddwd` needs.
+      acc1 = mm_add_epi32(acc1, mm_madd_epi16(mm_cvtepi8_epi16(mm_srli_si128(a0, 8)),
+                                              mm_cvtepi8_epi16(mm_srli_si128(b0, 8))))
+      i += 16
+    let acc = mm_add_epi32(acc0, acc1)
+    var t: array[4, int32]
+    mm_storeu_si128(t[0].addr, acc)
+    result = t[0] + t[1] + t[2] + t[3]
+    while i < n:
+      result += int32(pa[i]) * int32(pb[i])
+      inc i
 
 proc normalize*(v: var seq[float32]) =
-  var sum = 0.0'f32
-  for x in v:
-    sum += x * x
-  let norm = sqrt(sum)
-  if norm > 0:
-    for i in 0 ..< v.len:
-      v[i] = v[i] / norm
+  when defined(hnswSimd):
+    ## Two vectorized passes - sum the squares, then scale by 1/norm. Scaling by
+    ## the reciprocal instead of dividing per component is a small accuracy trade
+    ## that the multiply saves over the divide.
+    let n = v.len
+    var i = 0
+    var acc0 = mm256_setzero_ps()
+    var acc1 = mm256_setzero_ps()
+    while i + 16 <= n:
+      let x0 = mm256_loadu_ps(v[i].addr)
+      acc0 = mm256_add_ps(acc0, mm256_mul_ps(x0, x0))
+      let x1 = mm256_loadu_ps(v[i + 8].addr)
+      acc1 = mm256_add_ps(acc1, mm256_mul_ps(x1, x1))
+      i += 16
+    let acc = mm256_add_ps(acc0, acc1)
+    var s = mm_add_ps(mm256_castps256_ps128(acc), mm256_extractf128_ps(acc, 1))
+    s = mm_hadd_ps(s, s)
+    s = mm_hadd_ps(s, s)
+    var buf: array[4, float32]
+    mm_storeu_ps(buf[0].addr, s)
+    var sum = buf[0]
+    while i < n:
+      sum += v[i] * v[i]
+      inc i
+    let norm = sqrt(sum)
+    if norm > 0:
+      let inv = mm256_set1_ps(1.0'f32 / norm)
+      i = 0
+      while i + 8 <= n:
+        mm256_storeu_ps(v[i].addr, mm256_mul_ps(mm256_loadu_ps(v[i].addr), inv))
+        i += 8
+      while i < n:
+        v[i] = v[i] * (1.0'f32 / norm)
+        inc i
+  else:
+    var sum = 0.0'f32
+    for x in v:
+      sum += x * x
+    let norm = sqrt(sum)
+    if norm > 0:
+      for i in 0 ..< v.len:
+        v[i] = v[i] / norm
 
 proc dot(a, b: seq[float32]): float32 =
-  for i in 0 ..< a.len:
-    result += a[i] * b[i]
+  when defined(hnswSimd):
+    if a.len > 0:
+      return simdDotF32(cast[ptr UncheckedArray[float32]](a[0].unsafeAddr),
+                        cast[ptr UncheckedArray[float32]](b[0].unsafeAddr), a.len)
+  else:
+    for i in 0 ..< a.len:
+      result += a[i] * b[i]
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +506,7 @@ proc quantizeInt8*(v: openArray[float32], scale: float32,
   ## quantization but a real loss for `vqInt8Fixed`, so pick that grid with
   ## `quantizeScale` over the whole collection (or a deliberately generous upper
   ## bound) rather than from one vector.
-  result = newSeq[int8](v.len)
+  result = newSeqUninit[int8](v.len)
   if scale <= 0:
     return
   let inv = 1.0'f32 / scale
@@ -379,7 +545,7 @@ proc quantizeInt8*(v: openArray[float32]): tuple[codes: seq[int8], scale: float3
 proc dequantizeInt8*(codes: openArray[int8], scale: float32): seq[float32] =
   ## Back to float32: `code * scale`. This is the lossy step; every component is
   ## off by at most `scale / 2`.
-  result = newSeq[float32](codes.len)
+  result = newSeqUninit[float32](codes.len)
   for i, c in codes:
     result[i] = float32(c) * scale
 
@@ -392,10 +558,17 @@ proc dotInt8*(a, b: openArray[int8], scaleA = 1.0'f32,
   ## For two L2-normalised vectors that were quantized on the same grid this is
   ## their cosine similarity, with no extra error beyond the quantization.
   doAssert a.len == b.len, "dimension mismatch: " & $a.len & " vs " & $b.len
-  var acc = 0'i32
-  for i in 0 ..< a.len:
-    acc += int32(a[i]) * int32(b[i])
-  float32(acc) * scaleA * scaleB
+  when defined(hnswSimd):
+    if a.len > 0:
+      return float32(simdDotI8(cast[ptr UncheckedArray[int8]](a[0].unsafeAddr),
+                               cast[ptr UncheckedArray[int8]](b[0].unsafeAddr),
+                               a.len)) * scaleA * scaleB
+    return 0.0'f32
+  else:
+    var acc = 0'i32
+    for i in 0 ..< a.len:
+      acc += int32(a[i]) * int32(b[i])
+    float32(acc) * scaleA * scaleB
 
 proc packInt8*(xs: openArray[int8]): string =
   ## A dim-byte blob for YottaDB - a quarter of what `packFloats` writes for the
@@ -408,7 +581,7 @@ proc packInt8*(xs: openArray[int8]): string =
 
 proc unpackInt8*(s: string): seq[int8] =
   ## Inverse of `packInt8`: one byte per dimension, `s.len` == dim.
-  result = newSeq[int8](s.len)
+  result = newSeqUninit[int8](s.len)
   if s.len > 0:
     copyMem(result[0].addr, s[0].unsafeAddr, s.len)
 
@@ -463,8 +636,30 @@ proc distanceStored(a, b: StoredVec): float32 =
   1.0'f32 - dotStored(a, b)
 
 proc loadVec(ix: HnswIndex, id: int): StoredVec =
-  ## The vector of `id` as stored - one YottaDB read. In the quantized modes this
-  ## never materializes float32; the codes come back as they are on disk.
+  ## The vector of `id` as stored - from the in-process cache when there is one,
+  ## otherwise one YottaDB read. In the quantized modes this never materializes
+  ## float32; the codes come back as they are on disk.
+  ##
+  ## With a cache the read pattern is what makes this cheap: `searchLayer` asks
+  ## for a thousand different ids per query, so a lazy cache (fill on first touch)
+  ## would hit almost nothing and only add a lookup - the win comes from
+  ## `preloadVectors` having the whole index in memory already.
+  if id >= 0 and id < ix.cache.present.len and ix.cache.present[id]:
+    let base = id * ix.cache.dim
+    case ix.params.quant
+    of vqNone:
+      result.floats = newSeqUninit[float32](ix.cache.dim)
+      copyMem(result.floats[0].addr, ix.cache.floats[base].unsafeAddr, ix.cache.dim * sizeof(float32))
+    of vqInt8:
+      result.codes = newSeqUninit[int8](ix.cache.dim)
+      copyMem(result.codes[0].addr, ix.cache.codes[base].unsafeAddr, ix.cache.dim)
+      result.scale = ix.cache.scales[id]
+    of vqInt8Fixed:
+      result.scale = ix.params.quantScale
+      result.codes = newSeqUninit[int8](ix.cache.dim)
+      copyMem(result.codes[0].addr, ix.cache.codes[base].unsafeAddr, ix.cache.dim)
+    return
+
   let s = ydb_get(ix.params.globalNode, @[$id, "vec"])
   if s.len == 0:
     return
@@ -475,7 +670,105 @@ proc loadVec(ix: HnswIndex, id: int): StoredVec =
     result.scale = ix.params.quantScale
     result.codes = unpackInt8(s)
 
+# ---------------------------------------------------------------------------
+# in-process vector cache
+# ---------------------------------------------------------------------------
+
+proc cacheOn(ix: HnswIndex): bool =
+  ## Whether a cache exists at all.
+  ix.cache.present.len > 0
+
+proc cacheGrow(ix: HnswIndex, id: int) =
+  ## Make room for `id`, keeping the arenas indexed by id (ids are dense, so the
+  ## index is the id and there is nothing to look up).
+  if id < ix.cache.present.len:
+    return
+  let need = id + 1
+  ix.cache.present.setLen(need)
+  case ix.params.quant
+  of vqNone:
+    ix.cache.floats.setLen(need * ix.cache.dim)
+  of vqInt8:
+    ix.cache.codes.setLen(need * ix.cache.dim)
+    ix.cache.scales.setLen(need)
+  of vqInt8Fixed:
+    ix.cache.codes.setLen(need * ix.cache.dim)
+
+proc cachePut(ix: HnswIndex, id: int, v: StoredVec) =
+  ## Mirror `v` into the cache. Called from `putVec`, so every write this index
+  ## makes keeps the cache coherent and an insert never invalidates it.
+  if not ix.cacheOn:
+    return
+  ix.cacheGrow(id)
+  let base = id * ix.cache.dim
+  case ix.params.quant
+  of vqNone:
+    if v.floats.len == ix.cache.dim:
+      copyMem(ix.cache.floats[base].addr, v.floats[0].unsafeAddr,
+              ix.cache.dim * sizeof(float32))
+  of vqInt8:
+    if v.codes.len == ix.cache.dim:
+      copyMem(ix.cache.codes[base].addr, v.codes[0].unsafeAddr, ix.cache.dim)
+      ix.cache.scales[id] = v.scale
+  of vqInt8Fixed:
+    if v.codes.len == ix.cache.dim:
+      copyMem(ix.cache.codes[base].addr, v.codes[0].unsafeAddr, ix.cache.dim)
+  ix.cache.present[id] = true
+
+proc preloadVectors*(ix: HnswIndex): int =
+  ## Read every vector into process memory, returning how many were loaded.
+  ##
+  ## One query scores on the order of a thousand candidates, each of which is a
+  ## separate `ydb_get` costing about 2 us - roughly seven times what the
+  ## distance it feeds costs to compute. With the vectors in memory a query only
+  ## goes to YottaDB for the neighbour lists.
+  ##
+  ## Memory is `dim * count` bytes in the quantized modes and `4 * dim * count`
+  ## for `vqNone` (1.4 GB for the 730k-vector article index), owned by the index
+  ## object. The pass is O(count) reads, so it belongs in an open path, not in a
+  ## query - `HnswParams.cacheVectors` does exactly that.
+  ##
+  ## The cache is a mirror, never the source of truth: writes go to YottaDB
+  ## first and are mirrored here, so nothing is lost if the process dies. The one
+  ## thing it cannot see is *another* process writing to the same global; call
+  ## this again (or reopen) to pick such changes up.
+  if ix.dim <= 0 or ix.count == 0:
+    return 0
+  ix.cache = VecStore(dim: ix.dim)
+  ix.cacheGrow(ix.count - 1)
+  for id in 0 ..< ix.count:
+    let s = ydb_get(ix.params.globalNode, @[$id, "vec"])
+    if s.len == 0:
+      continue                      # deleted id, or never written
+    case ix.params.quant
+    of vqNone:
+      if s.len != ix.dim * sizeof(float32):
+        continue
+      copyMem(ix.cache.floats[id * ix.dim].addr, s[0].unsafeAddr, s.len)
+    of vqInt8:
+      if s.len != sizeof(float32) + ix.dim:
+        continue
+      copyMem(ix.cache.scales[id].addr, s[0].unsafeAddr, sizeof(float32))
+      copyMem(ix.cache.codes[id * ix.dim].addr, s[sizeof(float32)].unsafeAddr, ix.dim)
+    of vqInt8Fixed:
+      if s.len != ix.dim:
+        continue
+      copyMem(ix.cache.codes[id * ix.dim].addr, s[0].unsafeAddr, ix.dim)
+    ix.cache.present[id] = true
+    inc result
+  ix.cache.complete = true
+  echo "Cache loaded with ", result, " entries."
+
+proc cachedVectors*(ix: HnswIndex): int =
+  ## How many vectors the in-process cache holds (0 when there is none). A scan
+  ## over the id range, so it is for statistics, not for a query loop.
+  for p in ix.cache.present:
+    if p: inc result
+
 proc putVec(ix: HnswIndex, id: int, v: StoredVec) =
+  ## YottaDB first, then the mirror - never the other way round, so an
+  ## interrupted write can only leave the cache behind, not ahead of the
+  ## database.
   case ix.params.quant
   of vqNone:
     ydb_set(ix.params.globalNode, @[$id, "vec"], packFloats(v.floats))
@@ -483,6 +776,7 @@ proc putVec(ix: HnswIndex, id: int, v: StoredVec) =
     ydb_set(ix.params.globalNode, @[$id, "vec"], packQVec(v.scale, v.codes))
   of vqInt8Fixed:
     ydb_set(ix.params.globalNode, @[$id, "vec"], packInt8(v.codes))
+  ix.cachePut(id, v)
 
 proc toStored(ix: HnswIndex, v: seq[float32]): StoredVec =
   ## Encode an L2-normalised vector the way this index stores it. This is the
@@ -503,7 +797,7 @@ proc toStored(ix: HnswIndex, v: seq[float32]): StoredVec =
 # ---------------------------------------------------------------------------
 
 proc putLevel(ix: HnswIndex, id, level: int) =
-  ydb_set(ix.params.globalNode, @[$id, "level"], packLevel(level))
+  ydb_set(ix.params.globalNode, @[$id, "level"], $level)
 
 proc getLevel(ix: HnswIndex, id: int): int =
   let s = ydb_get(ix.params.globalNode, @[$id, "level"])
@@ -584,16 +878,20 @@ proc deriveGlobalNames(p: var HnswParams) =
 
 proc hnswParams*(global: string, model = DefaultModel,
                  M = 16, efConstruction = 200, efSearch = 64, seed = 1234,
-                 dim = 0, quant = vqNone, quantScale = 0.0'f32): HnswParams =
+                 dim = 0, quant = vqNone, quantScale = 0.0'f32,
+                 cacheVectors = false): HnswParams =
   ## Configure one index: `global` is the YottaDB global (`^HNSWxxx`) and the
   ## `NODE` / `KEY` / `META` names are derived from it, so no caller spells the
   ## layout out a second time.
   ##
   ## `model`, `dim`, `quant` and `quantScale` only have to be right the first
   ## time; an index that already exists keeps what META says (see `openHnsw`).
+  ## `cacheVectors` is not stored in META and is honoured on every open, so it is
+  ## the one thing here that always takes effect.
   result = HnswParams(global: global, model: model, M: M,
                       efConstruction: efConstruction, efSearch: efSearch,
-                      seed: seed, dim: dim, quant: quant, quantScale: quantScale)
+                      seed: seed, dim: dim, quant: quant, quantScale: quantScale,
+                      cacheVectors: cacheVectors)
   deriveGlobalNames(result)
 
 proc openHnsw*(p: HnswParams): HnswIndex =
@@ -621,6 +919,12 @@ proc openHnsw*(p: HnswParams): HnswIndex =
   ## through `setModelLoader`; with no loader installed the name is only carried.
   new(result)
   result.params = p
+  # Fill in `^...NODE` / `^...KEY` / `^...META` from `p.global` if the caller wrote
+  # the params out as an `HnswParams` rather than going through `hnswParams` -
+  # otherwise an empty name reaches the C API, and YottaDB answers that either
+  # from the *previous* call's global (reading something unrelated) or with
+  # %YDB-E-INVVARNAME, depending on what ran before. Neither is what the contract
+  # above promises.
   deriveGlobalNames(result.params)
   result.rng = initRand(result.params.seed)
   result.entry = -1
@@ -662,9 +966,19 @@ proc openHnsw*(p: HnswParams): HnswIndex =
     # the default) - that resolved name is what the index is described by.
     result.params.model = modelLoader(result.params.model)
 
+  # The vector cache is not part of an index's identity the way M, dim and the
+  # storage mode are - it mirrors what is already there and can be thrown away -
+  # so it is the one thing that comes from `p` and not from META. Reading the
+  # vectors back is O(count) round trips, hence the explicit opt-in.
+  if result.params.cacheVectors:
+    discard result.preloadVectors()
+
 
 proc hasId*(ix: HnswIndex, id: int): bool =
-  ## Whether a live node exists at `id`. One YottaDB `data` call, no value read.
+  ## Whether a live node exists at `id`. One YottaDB `data` call, no value read -
+  ## and no call at all once `preloadVectors` has made the cache complete.
+  if ix.cache.complete and id >= 0 and id < ix.cache.present.len:
+    return ix.cache.present[id]
   ydb_data(ix.params.globalNode, @[$id, "vec"]) != 0
 
 proc liveCount*(ix: HnswIndex): int =
@@ -835,7 +1149,6 @@ proc add*(ix: HnswIndex, vec: openArray[float32], key = ""): int =
   var v = @vec
   if ix.dim == 0:
     ix.dim = v.len
-    ix.metaSet("dim", $ix.dim)
   doAssert v.len == ix.dim, "vector has " & $v.len & " dims, index expects " & $ix.dim
   normalize(v)
 
@@ -850,10 +1163,15 @@ proc add*(ix: HnswIndex, vec: openArray[float32], key = ""): int =
   # and efConstruction it was built with, so a later open() must not be able to
   # change them (openHnsw prefers whatever the database already holds). Same for
   # the storage mode, which decides how every vector blob in the index decodes,
-  # and for the embedding model, which decides what the vectors mean.
+  # and for the embedding model, which decides what the vectors mean. The
+  # dimension goes here too - `ix.dim` is settled by now, whether it came from
+  # the caller or from the first vector - because everything that reads the index
+  # back (including `preloadVectors`) needs it, and an open that only has the
+  # default 0 would otherwise find a dimension-less index.
   if ix.count == 0:
     ix.metaSet("M", $ix.params.M)
     ix.metaSet("efConstruction", $ix.params.efConstruction)
+    ix.metaSet("dim", $ix.dim)
     ix.metaSet("quant", $ix.params.quant)
     if ix.params.quant == vqInt8Fixed:
       ix.metaSet("qscale", $ix.params.quantScale)
@@ -1019,6 +1337,11 @@ proc delete*(ix: HnswIndex, id: int): bool =
   # every links/<layer>. YDB_DEL_NODE (= 2) would only clear this node's value.
   ydb_delete(ix.params.globalNode, @[$id], YDB_DEL_TREE)
 
+  # The id is a hole in the cache now too - and stays one, since ids are never
+  # recycled, so this flag never has to be set back by anything but `add`.
+  if id < ix.cache.present.len:
+    ix.cache.present[id] = false
+
   dec ix.live
   ix.metaSet("live", $ix.live)
 
@@ -1129,18 +1452,6 @@ proc search*(ix: HnswIndex, vec: openArray[float32], k = 5, ef = 0): seq[Hit] =
 # ---------------------------------------------------------------------------
 # introspection
 # ---------------------------------------------------------------------------
-
-#proc vectorOf*(ix: HnswIndex, id: int): seq[float32] =
-#  ix.getVec(id)
-
-#proc payloadOf*(ix: HnswIndex, id: int): string =
-#  ix.getPayload(id)
-
-#proc levelOf*(ix: HnswIndex, id: int): int =
-#  ix.getLevel(id)
-
-#proc linksOf*(ix: HnswIndex, id, level: int): seq[int] =
-#  ix.getLinks(id, level)
 
 proc levelsSummary*(ix: HnswIndex): string =
   ## "node id -> top layer" and the link counts on each layer, for eyeballing

@@ -3,6 +3,15 @@ when withDir(thisDir(), system.fileExists("nimble.paths")):
   include "nimble.paths"
 # end Nimble config
 
+# --- hnsw.nim distance kernels -----------------------------------------------
+# `dot`, `dotInt8` and `normalize` use the nimsimd intrinsics; -mavx is what lets
+# the C compiler accept them. Build with `-d:hnswNoSimd` (or delete these three
+# lines) to get the scalar kernels instead, which compile for any x86-64 - about
+# 4x slower on the float32 dot, 6x on the int8 one, 7x on normalize.
+if not defined(hnswNoSimd):
+  switch("define", "hnswSimd")
+  switch("passC", "-mavx")
+
 # --- YottaDB linking ---------------------------------------------------------
 # nimyottadb declares the YottaDB C API with plain `importc` pragmas (no
 # `dynlib`), so the symbols have to be linked in from libyottadb.so. That
