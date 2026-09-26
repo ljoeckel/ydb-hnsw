@@ -879,7 +879,7 @@ proc deriveGlobalNames(p: var HnswParams) =
 proc hnswParams*(global: string, model = DefaultModel,
                  M = 16, efConstruction = 200, efSearch = 64, seed = 1234,
                  dim = 0, quant = vqNone, quantScale = 0.0'f32,
-                 cacheVectors = false): HnswParams =
+                 cacheVectors = false, batchSize = 128): HnswParams =
   ## Configure one index: `global` is the YottaDB global (`^HNSWxxx`) and the
   ## `NODE` / `KEY` / `META` names are derived from it, so no caller spells the
   ## layout out a second time.
@@ -891,7 +891,7 @@ proc hnswParams*(global: string, model = DefaultModel,
   result = HnswParams(global: global, model: model, M: M,
                       efConstruction: efConstruction, efSearch: efSearch,
                       seed: seed, dim: dim, quant: quant, quantScale: quantScale,
-                      cacheVectors: cacheVectors)
+                      cacheVectors: cacheVectors, batchSize: batchSize)
   deriveGlobalNames(result)
 
 proc openHnsw*(p: HnswParams): HnswIndex =
