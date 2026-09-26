@@ -22,9 +22,9 @@
 ##   ^HNSWxxxMETA("quant")           vector storage mode (see below)
 ##   ^HNSWxxxMETA("qscale")          shared int8 grid, only for vqInt8Fixed
 ##   ^HNSWxxxMETA("model")           embedding model the vectors come from
-##   ^HNSWxxxNODE(id,"vec")          the L2-normalised vector, see below
-##   ^HNSWxxxNODE(id,"level")        top layer of this node
-##   ^HNSWxxxNODE(id,"links",layer)  neighbour ids as int64 (only if non-empty)
+##   ^HNSWxxxNODE(id)                the L2-normalised vector, see below
+##   ^HNSWxxxLINKS(id, layer)        neighbour ids as int64 (only if non-empty)
+##   ^HNSWxxxLEVEL(id)               top layer of the node
 ##   ^HNSWxxxKEY(key)                node id for an external key
 ##
 ## The key index is what makes incremental loading safe: `lookup` / `contains`
@@ -136,6 +136,8 @@ type
     model*: string = DefaultModel   ## The hugging face model name
     global*: string                 ## YottaDB global basename ^HNSWxxx
     globalNode*: string             ## YottaDB global ^HNSWxxxNODE
+    globalLinks*: string            ## YottaDB global ^HNSWxxxLINKS
+    globalLevel*: string            ## YottaDB global ^HNSWxxxLEVEL
     globalKey*: string              ## YottaDB global ^HNSWxxxKEY
     globalMeta*: string             ## YottaDB global ^HNSWxxxMETA
     M*: int = 16                    ## links per node above layer 0
@@ -696,7 +698,7 @@ proc loadVec(ix: HnswIndex, id: int): StoredVec =
   # Check if id is already zeros-cache (old deleted vector)
   if id in zerosCache: 
     return
-  let s = ydb_get(ix.params.globalNode, @[$id, "vec"])
+  let s = ydb_get(ix.params.globalNode, @[$id])
   if s.len == 0:
     zerosCache.incl(id) # add to zeros-cache
     return
@@ -839,7 +841,7 @@ proc preloadVectors*(ix: HnswIndex): int =
   echo "Preloading up to ", ix.live, " vector(s) of ", ix.count, " id(s)"
 
   for id in 0 ..< ix.count:
-    let s = ydb_get(ix.params.globalNode, @[$id, "vec"])
+    let s = ydb_get(ix.params.globalNode, @[$id])
     if s.len == 0:
       continue                      # deleted id, or never written
     let slot = ix.cache.nSlots
@@ -878,11 +880,11 @@ proc putVec(ix: HnswIndex, id: int, v: StoredVec) =
   ## database.
   case ix.params.quant
   of vqNone:
-    ydb_set(ix.params.globalNode, @[$id, "vec"], packFloats(v.floats))
+    ydb_set(ix.params.globalNode, @[$id], packFloats(v.floats))
   of vqInt8:
-    ydb_set(ix.params.globalNode, @[$id, "vec"], packQVec(v.scale, v.codes))
+    ydb_set(ix.params.globalNode, @[$id], packQVec(v.scale, v.codes))
   of vqInt8Fixed:
-    ydb_set(ix.params.globalNode, @[$id, "vec"], packInt8(v.codes))
+    ydb_set(ix.params.globalNode, @[$id], packInt8(v.codes))
   ix.cachePut(id, v)
 
 proc toStored(ix: HnswIndex, v: seq[float32]): StoredVec =
@@ -904,10 +906,10 @@ proc toStored(ix: HnswIndex, v: seq[float32]): StoredVec =
 # ---------------------------------------------------------------------------
 
 proc putLevel(ix: HnswIndex, id, level: int) =
-  ydb_set(ix.params.globalNode, @[$id, "level"], $level)
+  ydb_set(ix.params.globalLevel, @[$id], $level)
 
 proc getLevel(ix: HnswIndex, id: int): int =
-  let s = ydb_get(ix.params.globalNode, @[$id, "level"])
+  let s = ydb_get(ix.params.globalLevel, @[$id])
   if s.len == 0: 0 else: parseInt(s)
 
 
@@ -930,10 +932,10 @@ proc contains*(ix: HnswIndex, key: string): bool =
 
 proc putLinks(ix: HnswIndex, id, level: int, links: openArray[int]) =
   if links.len > 0:
-    ydb_set(ix.params.globalNode, @[$id, "links", $level], packInts(links))
+    ydb_set(ix.params.globalLinks, @[$id, $level], packInts(links))
 
 proc getLinks(ix: HnswIndex, id, level: int): seq[int] =
-  unpackInts(ydb_get(ix.params.globalNode, @[$id, "links", $level]))
+  unpackInts(ydb_get(ix.params.globalLinks, @[$id, $level]))
 
 proc metaSet(ix: HnswIndex, key, value: string) =
   ydb_set(ix.params.globalMeta, @[key], value)
@@ -961,9 +963,9 @@ proc maxLinks*(ix: HnswIndex, level: int): int =
 # global names
 # ---------------------------------------------------------------------------
 
-proc nodeGlobal*(global: string): string = global & "NODE"
-proc keyGlobal*(global: string): string = global & "KEY"
-proc metaGlobal*(global: string): string = global & "META"
+# proc nodeGlobal*(global: string): string = global & "NODE"
+# proc keyGlobal*(global: string): string = global & "KEY"
+# proc metaGlobal*(global: string): string = global & "META"
 
 
 # ---------------------------------------------------------------------------
@@ -979,9 +981,12 @@ proc setModelLoader*(loader: ModelLoader) =
 proc deriveGlobalNames(p: var HnswParams) =
   ## Fill in the `^...NODE` / `^...KEY` / `^...META` names that belong to
   ## `p.global`, unless a caller named them itself.
-  if p.globalNode.len == 0: p.globalNode = p.global.nodeGlobal
-  if p.globalKey.len == 0: p.globalKey = p.global.keyGlobal
-  if p.globalMeta.len == 0: p.globalMeta = p.global.metaGlobal
+
+  if p.globalNode.len == 0: p.globalNode = p.global & "NODE"
+  if p.globalLinks.len == 0: p.globalLinks = p.global & "LINKS"
+  if p.globalLevel.len == 0: p.globalLevel = p.global & "LEVEL"
+  if p.globalKey.len == 0: p.globalKey = p.global & "KEY"
+  if p.globalMeta.len == 0: p.globalMeta = p.global & "META"
 
 proc hnswParams*(global: string, model = DefaultModel,
                  M = 16, efConstruction = 200, efSearch = 64, seed = 1234,
@@ -1086,7 +1091,7 @@ proc hasId*(ix: HnswIndex, id: int): bool =
   ## and no call at all once `preloadVectors` has made the cache complete.
   if ix.cache.complete and id >= 0 and id < ix.cache.idToSlot.len:
     return ix.cache.idToSlot[id] >= 0
-  ydb_data(ix.params.globalNode, @[$id, "vec"]) != 0
+  ydb_data(ix.params.globalNode, @[$id]) != 0
 
 proc liveCount*(ix: HnswIndex): int =
   ## Number of nodes actually in the graph (`ix.count` is the id high-water
@@ -1096,7 +1101,7 @@ proc liveCount*(ix: HnswIndex): int =
 proc nodeCount*(global: string): int =
   ## Number of nodes straight from YottaDB, without building an index object.
   ## Reads the META global, so it works for any index name.
-  let meta = global.metaGlobal
+  let meta = global & "META"
   let live = ydb_get(meta, @["live"])
   if live.len > 0:
     return parseInt(live)
@@ -1390,7 +1395,7 @@ proc unlink(ix: HnswIndex, id: int): seq[(int, int)] =
       if kept.len == nLinks.len:
         continue                      # link was already pruned one-way
       if kept.len == 0:
-        ydb_delete(ix.params.globalNode, @[$n, "links", $l], YDB_DEL_NODE)
+        ydb_delete(ix.params.globalLinks, @[$n, $l], YDB_DEL_NODE)
         result.add (n, l)
       else:
         ix.putLinks(n, l, kept)
@@ -1440,9 +1445,9 @@ proc delete*(ix: HnswIndex, id: int): bool =
   if key.len > 0 and ix.lookup(key) == id:
     ydb_delete(ix.params.globalKey, @[key], YDB_DEL_NODE)
 
-  # YDB_DEL_TREE (= 1) removes the node and everything under it: vec, level and
-  # every links/<layer>. YDB_DEL_NODE (= 2) would only clear this node's value.
-  ydb_delete(ix.params.globalNode, @[$id], YDB_DEL_TREE)
+  ydb_delete(ix.params.globalLevel, @[$id], YDB_DEL_NODE)
+  ydb_delete(ix.params.globalLinks, @[$id], YDB_DEL_TREE)
+  ydb_delete(ix.params.globalNode, @[$id], YDB_DEL_NODE)
 
   # The id is gone from the cache too. The store is dense, so this leaves no hole
   # behind: the slot goes back and the next `cachePut` reuses it.
@@ -1565,7 +1570,7 @@ proc levelsSummary*(ix: HnswIndex): string =
   ## are holes in the id space, not level-0 nodes.
   var perLevel: seq[int]
   for id in 0 ..< ix.count:
-    let s = ydb_get(ix.params.globalNode, @[$id, "level"])
+    let s = ydb_get(ix.params.globalLevel, @[$id])
     if s.len == 0:
       continue
     let lv = parseInt(s)
