@@ -1,5 +1,7 @@
 # ydb-hnsw
-A vector db implementation in Nim with YottaDB as database backend
+A vector db implementation in Nim with YottaDB as database backend.
+It is implemented by using a HNSW index.
+A Hierarchical Navigable Small World (HNSW) Index is a highly efficient, graph-based algorithm for the approximate search for the nearest neighbors (Approximate Nearest Neighbor, ANN) in high-dimensional vector data. It is mainly used in modern vector databases and AI applications
 
 # Python3 install
 
