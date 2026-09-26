@@ -1,4 +1,4 @@
-import std/[strformat, strutils, tables, enumerate]
+import std/[strformat, strutils, sets, enumerate]
 
 import bert_nim     # nimpy glue: embed(); its own demo stays dormant
 import hnsw
@@ -7,17 +7,32 @@ import common       # getRssRef / getRssTitle / getRssDescription
 import yottadb
 import rsstypes
 
-const BatchSize = 256
+const BatchSize = 128
+const MinDescriptionLen = 35
 
-var empty, duplicates, vectors = 0
+const MinSim = 0.90'f32
+    ## Similarity a neighbour has to reach to be reported as related, and the
+    ## shortlist the duplicate test runs over. `search` returns the k *nearest*,
+    ## never the k most similar, so without this "no results" and "no similar
+    ## results" are the same thing. 0.6 - the value that used to sit in the loop
+    ## as a commented-out filter - is far too low to mean anything on these
+    ## MiniLM vectors.
 
-proc sanitize(label: string): bool =
-    if label.isEmptyOrWhitespace(): return true
-    if label == "mehr": return true
+## Report counters. `queries` is how many articles were actually looked at and
+## `similar` how many had at least one neighbour above `MinSim`; together they
+## say whether the search is finding anything at all. `skipped` counts articles
+## an earlier iteration already deleted as somebody else's duplicate - the
+## article iterator walks ^RSSItem and still hands them out.
+var empty, duplicates, skipped, queries, similar = 0
+
+proc sanitize(description: string): bool =
+    if description.len < MinDescriptionLen: return true
+    if description == "mehr": return true
     false
 
 
 proc delete(ix: HnswIndex, hit: Hit) =
+    echo "delete ", hit.id
     # Get rssref to access ydb
     let rssref = getRssRef(hit.id)
     if rssref.len == 0:
@@ -43,26 +58,62 @@ proc updateVecEntry(key: string, vec: seq[float32]): bool =
     return false
 
 
-proc findDuplicates(ix: HnswIndex, vec: seq[float32], k = 5, remove = false) =
-    var t = newTable[string, seq[Hit]]()
+proc findDuplicates(ix: HnswIndex, key, title: string, vec: seq[float32],
+                    k = 10, minSim = MinSim, remove = false) =
+    ## Report one article and the neighbours close to it.
+    ##
+    ## The query *is* the article, so the header a group prints under is what the
+    ## lines below it are similar to. The previous version keyed its table on
+    ## `getRssTitle(hit.id)` and then re-printed that same title for every hit, so
+    ## each hit landed in a group named after itself: a group could only ever
+    ## collect nodes carrying an *identical* title. Related articles with
+    ## different wording - the very thing the report exists for - were spread
+    ## over singleton groups, which is what made it look like "not enough similar
+    ## results".
+    let self = ix.lookup(key)
+    if self < 0:
+        # Already deleted as somebody else's duplicate on an earlier iteration.
+        inc skipped
+        return
+    inc queries
 
-    # collect articles that seams are related
-    for hit in ix.search(vec, k = k):
-        if hit.sim() > 0.7:
-            t.mgetOrPut(getRssTitle(hit.id), @[]).add(hit)
+    # `ef` is widened with `k`: the index default is tuned around k ~ 5, and
+    # asking for more neighbours without a wider candidate window would just
+    # return more of the same few.
+    let hits = ix.search(vec, k = k, ef = max(k * 4, ix.params.efSearch))
 
-    for title, hits in t:
-        var lastDescription = ""
-        for hit in hits:
-            let description = getRssDescription(hit.id)
-            if lastDescription != "" and description == lastDescription:
-                inc duplicates
-                if remove: delete(ix, hit)
-            if sanitize(description):
-                inc empty
-                if remove: delete(ix, hit)
+    # Similarity only *shortlists*. What makes two articles duplicates is that
+    # they carry the same description - the syndication case - or none at all.
+    # Seeding with the query's own description is what `lastDescription` meant to
+    # do; comparing against the previous hit *inside one title bucket* could only
+    # ever fire when that bucket already held two identical titles.
+    var seen = initHashSet[string]()
+    seen.incl getRssDescription(self)
 
-            lastDescription = description
+    var found = 0
+    for hit in hits:
+        if hit.id == self:
+            continue                    # the article itself, similarity ~= 1.0
+        let sim = hit.sim()
+        if sim < minSim:
+            continue                    # nearest, but not similar
+        if found == 0:
+            echo title
+            inc similar
+        inc found
+
+        let description = getRssDescription(hit.id)
+        echo &"   {sim:.4f} {hit.id} : {getRssTitle(hit.id)}"
+        #echo &"                     - {description}"
+
+        if sanitize(description):
+            inc empty
+            if remove: delete(ix, hit)
+        elif description in seen:
+            inc duplicates
+            if remove: delete(ix, hit)
+        else:
+            seen.incl description
 
 
 iterator processTitles(titles: seq[string], keys: seq[string], cnt: int): (string, string, seq[float32]) =
@@ -110,14 +161,19 @@ when isMainModule:
 
     for (cnt, key, title, vec) in enumerate(batchedRSSItemIter(params.batchSize)):
         #echo cnt, " ", key, " ", title
-        if updateVecEntry(key, vec): inc vectors
+        #if updateVecEntry(key, vec): inc vectors
 
-        findDuplicates(ix, vec, k=3, remove=true)
+        findDuplicates(ix, key, title, vec, remove=true)
         if cnt mod params.batchSize == 0:
-            echo &"findDuplicates cnt:{cnt}, vectors:{vectors}, empty:{empty}, duplicates:{duplicates}"
-            updateDBStats("hnsw_clean")        
+            echo &"findDuplicates cnt:{cnt}, queries:{queries}, similar:{similar}, " &
+                 &"skipped:{skipped}, empty:{empty}, duplicates:{duplicates}"
+            updateDBStats("hnsw_clean") 
+
+        if cnt > 1000: break       
     
-    echo "New Vectors: ", vectors
-    echo "      Empty: ", empty
-    echo " Duplicates: ", duplicates
+    echo "   Queries: ", queries
+    echo "   Similar: ", similar
+    echo "   Skipped: ", skipped
+    echo "     Empty: ", empty
+    echo "Duplicates: ", duplicates
     updateDBStats("hnsw_clean")
