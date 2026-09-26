@@ -97,11 +97,13 @@
 ##     ~2.1 us against ~0.3 us for the scalar 384-dim dot. One query scores on the
 ##     order of a thousand candidates, so ~90 % of its 4.6 ms is YottaDB reads.
 ##     `HnswParams.cacheVectors` (or `preloadVectors`) mirrors the vectors into
-##     process memory - 4 * dim * count bytes, 1.4 GB for that index - and takes
-##     the query to ~0.9 ms. That is the bigger lever, and it is what lets the
-##     kernel speed matter at all.
+##     process memory - 4 * dim * live bytes, 1.1 GB for that index's 732k live
+##     vectors - and takes the query to ~0.9 ms. The store is dense, so it is the
+##     number of *live* vectors that sizes it, not the id high-water mark `count`
+##     (896k on that index, the difference being deletions). That is the bigger
+##     lever, and it is what lets the kernel speed matter at all.
 
-import std/[algorithm, heapqueue, math, random, sets, strutils, unicode]
+import std/[algorithm, heapqueue, math, random, sets, strutils, unicode, sets]
 import yottadb
 
 when defined(hnswSimd):
@@ -163,13 +165,25 @@ type
 
   VecStore = object
     ## Optional in-process copy of every vector in the index, see
-    ## `preloadVectors`. One flat arena indexed by `id * dim + component`, so a
-    ## lookup is arithmetic plus one copy - no per-vector seq to chase.
+    ## `preloadVectors`.
+    ##
+    ## Dense: the arena holds one entry per vector actually *present*, and the two
+    ## maps below translate between node ids and slots. Keying the arena by id
+    ## would size it `count` instead - a high-water mark that deletion pushes far
+    ## above the number of live vectors (896349 ids against 732151 vectors on the
+    ## article index, and the cleanup pass only widens that gap). A lookup is
+    ## still arithmetic plus one copy; the id -> slot indirection is the only
+    ## addition.
+    ##
+    ## Both maps are 8 bytes per entry against `4 * dim` for a float32 vector, so
+    ## the arena is what has to stay tight, not them.
     dim: int
-    floats: seq[float32]   ## vqNone: `dim` floats per id
-    codes: seq[int8]       ## quantized modes: `dim` codes per id
-    scales: seq[float32]   ## vqInt8: the per-vector scale, one per id
-    present: seq[bool]     ## whether `id` has a vector in the store
+    nSlots: int            ## slots filled; the arena may be reserved for more
+    floats: seq[float32]   ## vqNone: `dim` floats per slot
+    codes: seq[int8]       ## quantized modes: `dim` codes per slot
+    scales: seq[float32]   ## vqInt8: one scale per slot
+    idToSlot: seq[int]     ## id -> slot, -1 where `id` has no vector here
+    slotToId: seq[int]     ## slot -> owning id, `nSlots` entries
     complete: bool         ## the store covers the whole index - only then may
                            ## `hasId` answer from it instead of from YottaDB
 
@@ -204,6 +218,8 @@ proc cmpNeighbor(a, b: Neighbor): int = cmp(a.dist, b.dist)
 
 proc sim*(hit: Hit): float32 =
     1.0'f32 - hit.dist
+
+var zerosCache: HashSet[int]
 
 # ---------------------------------------------------------------------------
 # text normalization (dedup keys / embedding input)
@@ -635,6 +651,18 @@ proc distanceStored(a, b: StoredVec): float32 =
   ## Cosine distance between two L2-normalised stored vectors.
   1.0'f32 - dotStored(a, b)
 
+proc cacheSlot(ix: HnswIndex, id: int): int =
+  ## The slot holding `id`'s vector, or -1 when the cache has none for it: an id
+  ## outside the index, one whose vector was never mirrored, or a deleted one.
+  ##
+  ## It sits here rather than with the rest of the cache because `loadVec` - the
+  ## hot path - is the first thing that needs it.
+  if id >= 0 and id < ix.cache.idToSlot.len:
+    ix.cache.idToSlot[id]
+  else:
+    -1
+
+
 proc loadVec(ix: HnswIndex, id: int): StoredVec =
   ## The vector of `id` as stored - from the in-process cache when there is one,
   ## otherwise one YottaDB read. In the quantized modes this never materializes
@@ -644,8 +672,13 @@ proc loadVec(ix: HnswIndex, id: int): StoredVec =
   ## for a thousand different ids per query, so a lazy cache (fill on first touch)
   ## would hit almost nothing and only add a lookup - the win comes from
   ## `preloadVectors` having the whole index in memory already.
-  if id >= 0 and id < ix.cache.present.len and ix.cache.present[id]:
-    let base = id * ix.cache.dim
+  ##
+  ## An id the cache does not hold - never mirrored, or freed by a delete - falls
+  ## through to YottaDB, which is also how a deleted id is recognised: the read
+  ## comes back empty.
+  let slot = ix.cacheSlot(id)
+  if slot >= 0:
+    let base = slot * ix.cache.dim
     case ix.params.quant
     of vqNone:
       result.floats = newSeqUninit[float32](ix.cache.dim)
@@ -653,15 +686,19 @@ proc loadVec(ix: HnswIndex, id: int): StoredVec =
     of vqInt8:
       result.codes = newSeqUninit[int8](ix.cache.dim)
       copyMem(result.codes[0].addr, ix.cache.codes[base].unsafeAddr, ix.cache.dim)
-      result.scale = ix.cache.scales[id]
+      result.scale = ix.cache.scales[slot]
     of vqInt8Fixed:
       result.scale = ix.params.quantScale
       result.codes = newSeqUninit[int8](ix.cache.dim)
       copyMem(result.codes[0].addr, ix.cache.codes[base].unsafeAddr, ix.cache.dim)
     return
 
+  # Check if id is already zeros-cache (old deleted vector)
+  if id in zerosCache: 
+    return
   let s = ydb_get(ix.params.globalNode, @[$id, "vec"])
   if s.len == 0:
+    zerosCache.incl(id) # add to zeros-cache
     return
   case ix.params.quant
   of vqNone: result.floats = unpackFloats(s)
@@ -676,31 +713,56 @@ proc loadVec(ix: HnswIndex, id: int): StoredVec =
 
 proc cacheOn(ix: HnswIndex): bool =
   ## Whether a cache exists at all.
-  ix.cache.present.len > 0
+  ix.cache.idToSlot.len > 0
 
-proc cacheGrow(ix: HnswIndex, id: int) =
-  ## Make room for `id`, keeping the arenas indexed by id (ids are dense, so the
-  ## index is the id and there is nothing to look up).
-  if id < ix.cache.present.len:
+proc cacheIds(ix: HnswIndex, count: int) =
+  ## Make the id -> slot map cover every id below `count`. This is the one part
+  ## still keyed by id and so the one part that grows with `count` - which is why
+  ## it is a plain int seq and not a second arena.
+  if count <= ix.cache.idToSlot.len:
     return
-  let need = id + 1
-  ix.cache.present.setLen(need)
+  let have = ix.cache.idToSlot.len
+  ix.cache.idToSlot.setLen(count)
+  for i in have ..< count:
+    ix.cache.idToSlot[i] = -1
+
+proc cacheReserve(ix: HnswIndex, slots: int) =
+  ## Make room for at least `slots` vectors, and never for fewer - a slot a delete
+  ## frees is handed out again by the next `cachePut`, so the reservation does not
+  ## have to follow `nSlots` back down.
+  ##
+  ## `preloadVectors` reserves the whole index in one call, which is what keeps
+  ## the arena free of the geometric over-allocation an add-at-a-time build would
+  ## accumulate: one `setLen` to the target size is exact, whereas growing one
+  ## slot at a time leaves up to a third of the arena unused.
+  if slots <= ix.cache.slotToId.len:
+    return
+  ix.cache.slotToId.setLen(slots)
   case ix.params.quant
   of vqNone:
-    ix.cache.floats.setLen(need * ix.cache.dim)
+    ix.cache.floats.setLen(slots * ix.cache.dim)
   of vqInt8:
-    ix.cache.codes.setLen(need * ix.cache.dim)
-    ix.cache.scales.setLen(need)
+    ix.cache.codes.setLen(slots * ix.cache.dim)
+    ix.cache.scales.setLen(slots)
   of vqInt8Fixed:
-    ix.cache.codes.setLen(need * ix.cache.dim)
+    ix.cache.codes.setLen(slots * ix.cache.dim)
 
 proc cachePut(ix: HnswIndex, id: int, v: StoredVec) =
   ## Mirror `v` into the cache. Called from `putVec`, so every write this index
   ## makes keeps the cache coherent and an insert never invalidates it.
   if not ix.cacheOn:
     return
-  ix.cacheGrow(id)
-  let base = id * ix.cache.dim
+  ix.cacheIds(id + 1)
+  if ix.cache.idToSlot[id] < 0:
+    # A fresh id - or one whose slot a delete gave back. Reusing the freed slots
+    # before reserving more is what keeps a delete/insert cycle flat.
+    if ix.cache.nSlots >= ix.cache.slotToId.len:
+      ix.cacheReserve(ix.cache.nSlots + 1)
+    ix.cache.idToSlot[id] = ix.cache.nSlots
+    ix.cache.slotToId[ix.cache.nSlots] = id
+    inc ix.cache.nSlots
+  let slot = ix.cache.idToSlot[id]
+  let base = slot * ix.cache.dim
   case ix.params.quant
   of vqNone:
     if v.floats.len == ix.cache.dim:
@@ -709,11 +771,42 @@ proc cachePut(ix: HnswIndex, id: int, v: StoredVec) =
   of vqInt8:
     if v.codes.len == ix.cache.dim:
       copyMem(ix.cache.codes[base].addr, v.codes[0].unsafeAddr, ix.cache.dim)
-      ix.cache.scales[id] = v.scale
+      ix.cache.scales[slot] = v.scale
   of vqInt8Fixed:
     if v.codes.len == ix.cache.dim:
       copyMem(ix.cache.codes[base].addr, v.codes[0].unsafeAddr, ix.cache.dim)
-  ix.cache.present[id] = true
+
+proc cacheFree(ix: HnswIndex, id: int) =
+  ## Drop `id`'s vector from the cache, handing the slot back by swapping the last
+  ## one into it. That keeps slots `0 ..< nSlots` exactly the vectors that are
+  ## there - no hole per deleted id, which is the whole point of the dense store -
+  ## at the cost of one vector copy per delete instead of a free list to walk.
+  ##
+  ## `slotToId` is what makes the swap possible: without it the moved vector could
+  ## not be traced back to the id that has to be told about its new slot.
+  let slot = ix.cacheSlot(id)
+  if slot < 0:
+    return
+  let last = ix.cache.nSlots - 1
+  if slot != last:
+    let moved = ix.cache.slotToId[last]
+    let src = last * ix.cache.dim
+    let dst = slot * ix.cache.dim
+    # `dst + dim <= src`, so the two ranges cannot overlap and a plain copy is
+    # enough.
+    case ix.params.quant
+    of vqNone:
+      copyMem(ix.cache.floats[dst].addr, ix.cache.floats[src].unsafeAddr,
+              ix.cache.dim * sizeof(float32))
+    of vqInt8:
+      copyMem(ix.cache.codes[dst].addr, ix.cache.codes[src].unsafeAddr, ix.cache.dim)
+      ix.cache.scales[slot] = ix.cache.scales[last]
+    of vqInt8Fixed:
+      copyMem(ix.cache.codes[dst].addr, ix.cache.codes[src].unsafeAddr, ix.cache.dim)
+    ix.cache.slotToId[slot] = moved
+    ix.cache.idToSlot[moved] = slot
+  ix.cache.idToSlot[id] = -1
+  ix.cache.nSlots = last
 
 proc preloadVectors*(ix: HnswIndex): int =
   ## Read every vector into process memory, returning how many were loaded.
@@ -723,10 +816,12 @@ proc preloadVectors*(ix: HnswIndex): int =
   ## distance it feeds costs to compute. With the vectors in memory a query only
   ## goes to YottaDB for the neighbour lists.
   ##
-  ## Memory is `dim * count` bytes in the quantized modes and `4 * dim * count`
-  ## for `vqNone` (1.4 GB for the 730k-vector article index), owned by the index
-  ## object. The pass is O(count) reads, so it belongs in an open path, not in a
-  ## query - `HnswParams.cacheVectors` does exactly that.
+  ## Memory is `dim * live` bytes in the quantized modes and `4 * dim * live` for
+  ## `vqNone` (1.1 GB for the article index's 732k live vectors), plus the
+  ## `count`-entry id -> slot map, all owned by the index object. The store is
+  ## dense, so the deletions behind `count` no longer inflate it the way an
+  ## id-keyed arena would. The pass is O(count) reads, so it belongs in an open
+  ## path, not in a query - `HnswParams.cacheVectors` does exactly that.
   ##
   ## The cache is a mirror, never the source of truth: writes go to YottaDB
   ## first and are mirrored here, so nothing is lost if the process dies. The one
@@ -735,37 +830,47 @@ proc preloadVectors*(ix: HnswIndex): int =
   if ix.dim <= 0 or ix.count == 0:
     return 0
   ix.cache = VecStore(dim: ix.dim)
-  ix.cacheGrow(ix.count - 1)
-  echo "Preloading Vector cache with ", ix.count, " entries"
+  ix.cacheIds(ix.count)
+  # `live` comes from META, so the arena is reserved for the vectors that are
+  # actually there rather than for the id high-water mark: 4 * dim * live instead
+  # of 4 * dim * count. A stale `live` - or another writer - only costs one growth
+  # step in the loop below.
+  ix.cacheReserve(max(ix.live, 1))
+  echo "Preloading up to ", ix.live, " vector(s) of ", ix.count, " id(s)"
 
   for id in 0 ..< ix.count:
     let s = ydb_get(ix.params.globalNode, @[$id, "vec"])
     if s.len == 0:
       continue                      # deleted id, or never written
+    let slot = ix.cache.nSlots
     case ix.params.quant
     of vqNone:
       if s.len != ix.dim * sizeof(float32):
         continue
-      copyMem(ix.cache.floats[id * ix.dim].addr, s[0].unsafeAddr, s.len)
+      ix.cacheReserve(slot + 1)
+      copyMem(ix.cache.floats[slot * ix.dim].addr, s[0].unsafeAddr, s.len)
     of vqInt8:
       if s.len != sizeof(float32) + ix.dim:
         continue
-      copyMem(ix.cache.scales[id].addr, s[0].unsafeAddr, sizeof(float32))
-      copyMem(ix.cache.codes[id * ix.dim].addr, s[sizeof(float32)].unsafeAddr, ix.dim)
+      ix.cacheReserve(slot + 1)
+      copyMem(ix.cache.scales[slot].addr, s[0].unsafeAddr, sizeof(float32))
+      copyMem(ix.cache.codes[slot * ix.dim].addr, s[sizeof(float32)].unsafeAddr, ix.dim)
     of vqInt8Fixed:
       if s.len != ix.dim:
         continue
-      copyMem(ix.cache.codes[id * ix.dim].addr, s[0].unsafeAddr, ix.dim)
-    ix.cache.present[id] = true
+      ix.cacheReserve(slot + 1)
+      copyMem(ix.cache.codes[slot * ix.dim].addr, s[0].unsafeAddr, ix.dim)
+    ix.cache.idToSlot[id] = slot
+    ix.cache.slotToId[slot] = id
+    ix.cache.nSlots = slot + 1
     inc result
   ix.cache.complete = true
   echo "Cache loaded with ", result, " entries."
 
 proc cachedVectors*(ix: HnswIndex): int =
-  ## How many vectors the in-process cache holds (0 when there is none). A scan
-  ## over the id range, so it is for statistics, not for a query loop.
-  for p in ix.cache.present:
-    if p: inc result
+  ## How many vectors the in-process cache holds (0 when there is none). O(1) now
+  ## that the store is dense, instead of a scan over the whole id range.
+  ix.cache.nSlots
 
 proc putVec(ix: HnswIndex, id: int, v: StoredVec) =
   ## YottaDB first, then the mirror - never the other way round, so an
@@ -979,8 +1084,8 @@ proc openHnsw*(p: HnswParams): HnswIndex =
 proc hasId*(ix: HnswIndex, id: int): bool =
   ## Whether a live node exists at `id`. One YottaDB `data` call, no value read -
   ## and no call at all once `preloadVectors` has made the cache complete.
-  if ix.cache.complete and id >= 0 and id < ix.cache.present.len:
-    return ix.cache.present[id]
+  if ix.cache.complete and id >= 0 and id < ix.cache.idToSlot.len:
+    return ix.cache.idToSlot[id] >= 0
   ydb_data(ix.params.globalNode, @[$id, "vec"]) != 0
 
 proc liveCount*(ix: HnswIndex): int =
@@ -1339,10 +1444,9 @@ proc delete*(ix: HnswIndex, id: int): bool =
   # every links/<layer>. YDB_DEL_NODE (= 2) would only clear this node's value.
   ydb_delete(ix.params.globalNode, @[$id], YDB_DEL_TREE)
 
-  # The id is a hole in the cache now too - and stays one, since ids are never
-  # recycled, so this flag never has to be set back by anything but `add`.
-  if id < ix.cache.present.len:
-    ix.cache.present[id] = false
+  # The id is gone from the cache too. The store is dense, so this leaves no hole
+  # behind: the slot goes back and the next `cachePut` reuses it.
+  ix.cacheFree(id)
 
   dec ix.live
   ix.metaSet("live", $ix.live)

@@ -29,7 +29,7 @@ when isMainModule:
         # collect articles that seams are related
 
         for hit in ix.search(vec, k = 3):
-            if hit.sim() > 0.7:
+            if hit.sim() > 0.9:
                 #echo "   ", hit.sim()," ", getRssTitle(hit.id)
                 inc hits
 
@@ -37,7 +37,7 @@ when isMainModule:
             let avg = (getTime() - t1).inMicroseconds / 100
             t1 = getTime()
             echo &"cnt:{cnt} hits:{hits} avg:{avg}"
-            updateDBStats("hnsw_search")
+            #updateDBStats("hnsw_search")
 
 
 
