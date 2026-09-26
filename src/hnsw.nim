@@ -736,6 +736,8 @@ proc preloadVectors*(ix: HnswIndex): int =
     return 0
   ix.cache = VecStore(dim: ix.dim)
   ix.cacheGrow(ix.count - 1)
+  echo "Preloading Vector cache with ", ix.count, " entries"
+
   for id in 0 ..< ix.count:
     let s = ydb_get(ix.params.globalNode, @[$id, "vec"])
     if s.len == 0:

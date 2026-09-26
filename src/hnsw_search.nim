@@ -7,9 +7,9 @@ import common       # getRssRef / getRssTitle / getRssDescription
 import yottadb
 import rsstypes
 
-const BatchSize = 128
+const BatchSize = 256
 
-var empty, duplicates = 0
+var empty, duplicates, vectors = 0
 
 proc sanitize(label: string): bool =
     if label.isEmptyOrWhitespace(): return true
@@ -104,20 +104,20 @@ iterator batchedRSSItemIter(batchSize: int): (string, string, seq[float32]) =
 
 
 when isMainModule:
-    let params = hnswParams("^HNSWArticles", cacheVectors=true)
+    let params = hnswParams("^HNSWArticles", cacheVectors=true, batchSize=BatchSize)
     echo &"Opening the HNSW index with {params}"
     var ix = openHnsw(params)
 
     for (cnt, key, title, vec) in enumerate(batchedRSSItemIter(params.batchSize)):
-        echo cnt, " ", key, " ", title
-        if updateVecEntry(key, vec):
-            echo &"Added vector to RSSItem cnt:{cnt}, key:{key}"
+        #echo cnt, " ", key, " ", title
+        if updateVecEntry(key, vec): inc vectors
 
         findDuplicates(ix, vec, k=3, remove=true)
         if cnt mod params.batchSize == 0:
-            echo &"findDuplicates cnt:{cnt}, empty:{empty}, duplicates:{duplicates}"
+            echo &"findDuplicates cnt:{cnt}, vectors:{vectors}, empty:{empty}, duplicates:{duplicates}"
             updateDBStats("hnsw_clean")        
     
-    echo "     Empty: ", empty
-    echo "Duplicates: ", duplicates
+    echo "New Vectors: ", vectors
+    echo "      Empty: ", empty
+    echo " Duplicates: ", duplicates
     updateDBStats("hnsw_clean")
