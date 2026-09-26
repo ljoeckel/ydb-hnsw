@@ -169,7 +169,7 @@ when isMainModule:
                  &"skipped:{skipped}, empty:{empty}, duplicates:{duplicates}"
             updateDBStats("hnsw_clean") 
 
-        if cnt > 1000: break       
+        if cnt > BatchSize: break
     
     echo "   Queries: ", queries
     echo "   Similar: ", similar

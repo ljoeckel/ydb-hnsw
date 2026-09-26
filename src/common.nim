@@ -11,6 +11,14 @@ proc getRssRef*(id: int): seq[string] =
     else:
         @[]
 
+proc getRssTitle*(rssref: string): string = 
+    if rssref.len > 0 and rssref.contains(","):
+        let subs = rssref.split(",")
+        let title = Get ^RSSItem(subs, "title")
+        return hnswNormalize(title)
+    else:
+        return ""
+
 proc getRssTitle*(id: int): string =
     let rssref = getRssRef(id)
     let title = Get ^RSSItem(rssref, "title")

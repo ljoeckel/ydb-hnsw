@@ -5,8 +5,8 @@
 ## candidate window - it walks the whole layer-0 graph best-first - so it returns
 ## the exact top-k *of the reachable component*. It is the standard way to measure
 ## HNSW recall without building a second, brute-force index, and it needs no
-## embedding: the probes are vectors already in the index, read back from YottaDB
-## the way `hnsw_search_bench` does it.
+## embedding: the probes are vectors already in the index, read back from its own
+## store, `^...NODE(id)`.
 ##
 ## Two separate things are reported, because they fail for different reasons:
 ##
@@ -23,6 +23,10 @@
 ## A probe's own vector is read back from storage, so on a quantized index it is
 ## dequantized rather than bit-identical to the stored codes; `search`
 ## re-normalises and re-quantizes it, which is exactly what a real query does.
+##
+## This measures the window against the graph. `hnsw_recall_bruteforce` measures
+## the graph against the true neighbours in the same store - an exhaustive scan of
+## every `^...NODE(id)` - which is the recall a user experiences.
 ##
 ## Run: nim c -r -d:release -p:src src/test/hnsw_recall_check.nim [global] [probes] [k] [cache]
 ##   The exhaustive pass reads every reachable node per probe, so pass `cache`
@@ -45,20 +49,26 @@ proc unpackFloats(s: string): seq[float32] =
     copyMem(result[0].addr, s[0].unsafeAddr, n * sizeof(float32))
 
 proc queryVec(ix: HnswIndex, id: int): seq[float32] =
-  ## `id`'s stored vector as float32 - the same read `hnsw_search_bench` uses.
-  ## Returns an empty seq for an id without a vector.
-  let s = ydb_get(ix.params.globalNode, @[$id, "vec"])
+  ## `id`'s stored vector as float32 - the same read `hnsw.loadVec` does, from the
+  ## one place the store keeps it: `^...NODE(id)` is the vector, with nothing
+  ## under it. Empty for an id without a vector, or with a blob that does not
+  ## decode to the index's dimension - `search` asserts on that dimension, so an
+  ## odd entry must not reach it.
+  let s = ydb_get(ix.params.globalNode, @[$id])
+  if s.len == 0:
+    return
   case ix.params.quant
-  of vqNone:
-    unpackFloats(s)
+  of vqNone: result = unpackFloats(s)
   of vqInt8:
     if s.len <= sizeof(float32):
       return
     var scale: float32
     copyMem(scale.addr, s[0].unsafeAddr, sizeof(float32))
-    dequantizeInt8(unpackInt8(s[sizeof(float32) .. ^1]), scale)
+    result = dequantizeInt8(unpackInt8(s[sizeof(float32) .. ^1]), scale)
   of vqInt8Fixed:
-    dequantizeInt8(unpackInt8(s), ix.params.quantScale)
+    result = dequantizeInt8(unpackInt8(s), ix.params.quantScale)
+  if result.len != ix.dim:
+    result.setLen(0)
 
 proc main() =
   var global = DefaultGlobal
