@@ -28,4 +28,4 @@ proc deleteIndex(indexName: string) =
 
 #repair()
 #checkKey()
-deleteIndex("^HNSWArticles")
+#deleteIndex("^HNSWArticles")

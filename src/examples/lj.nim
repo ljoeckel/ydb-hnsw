@@ -1,13 +1,6 @@
-import yottadb
-import ydbutils
-
-import std/[strformat, strutils, tables, enumerate, times]
-
-import bert_nim     # nimpy glue: embed(); its own demo stays dormant
-import hnsw
-import rss_bridge
-import common       # getRssRef / getRssTitle / getRssDescription
-import rsstypes
+import std/[strformat, times]
+import ../ydbhnsw
+import hnsw_common       # getRssRef / getRssTitle / getRssDescription
 
 when isMainModule:
     var params = hnswParams("^HNSWArticles", cacheVectors=true)
@@ -29,14 +22,13 @@ when isMainModule:
         inc cnt
            
         # collect articles that seams are related
-        for hit in ix.search(vec, k = 5):
+        for hit in ix.search(vec, k = 3):
             if hit.sim() > 0.7:
-                echo "   ", hit.sim()," ", getRssTitle(hit.id)
+                echo &"   {hit.sim()} {hit.id} {getRssTitle(hit.id)}"
                 inc hits
 
         if cnt mod 100 == 0:
             let avg = (getTime() - t1).inMicroseconds / cnt
-            #t1 = getTime()
             echo &"cnt:{cnt} hits:{hits} avg:{avg}"
             #updateDBStats("hnsw_search")
             

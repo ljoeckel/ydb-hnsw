@@ -103,7 +103,7 @@
 ##     (896k on that index, the difference being deletions). That is the bigger
 ##     lever, and it is what lets the kernel speed matter at all.
 
-import std/[algorithm, heapqueue, math, random, sets, strutils, unicode, sets]
+import std/[algorithm, heapqueue, math, random, sets, strutils, unicode]
 import yottadb
 
 when defined(hnswSimd):
@@ -957,15 +957,6 @@ proc maxLinks*(ix: HnswIndex, level: int): int =
   ## Level 0 keeps twice as many links - that is where the whole graph gets
   ## walked, so it pays for itself there.
   if level == 0: 2 * ix.params.M else: ix.params.M
-
-
-# ---------------------------------------------------------------------------
-# global names
-# ---------------------------------------------------------------------------
-
-# proc nodeGlobal*(global: string): string = global & "NODE"
-# proc keyGlobal*(global: string): string = global & "KEY"
-# proc metaGlobal*(global: string): string = global & "META"
 
 
 # ---------------------------------------------------------------------------
