@@ -15,29 +15,20 @@ when isMainModule:
     
     let t1 = getTime() # set start for caclulation
 
-    #for (subs, vs) in QueryItr ^HNSWArticlesNODE.sv: 
-    for subs in QueryItr ^HNSWArticlesNODE.keys: 
-        let id = parseInt(subs[0])
-        let vec = ix.loadVec(id)
-        echo vec
-        # let id = Get ^HNSWArticlesKEY(subs[0])
-        # #echo getRssTitle(id)
-        # #let vs = Get ^HNSWArticlesNODE(subs)
-        # #let vec = unpackFloats(vs)
-        # let vec = unpackInt8(vs)
-        # inc cnt
-           
-        # collect articles that seams are related
-        # for hit in ix.search(vec, k = 3):
-        #     if hit.sim() > MinSim:
-        #         echo &"   {hit.sim()} {hit.id} {getRssTitle(hit.id)}"
-        #         inc hits
+    for (subs, vs) in QueryItr ^HNSWArticlesNODE.sv: 
+        let id = Get ^HNSWArticlesKEY(subs[0])
+        #echo getRssTitle(id)
 
-        # if cnt mod 100 == 0:
-        #     let avg = (getTime() - t1).inMicroseconds / cnt
-        #     echo &"cnt:{cnt} hits:{hits} avg:{avg}"
-        #     updateDBStats("hnsw_search")
+        # The stored value is the query: `searchBlob` decodes it exactly the way
+        # `loadVec` decodes a neighbour and walks - no float32, no normalise, no quantize.
+        for hit in ix.searchBlob(vs):
+            if hit.sim() > MinSim:
+                #echo &"   {hit.sim()} {hit.id} {getRssTitle(hit.id)}"
+                inc hits
+        inc cnt
+
+        if cnt mod 100 == 0:
+            let avg = (getTime() - t1).inMicroseconds / cnt
+            echo &"cnt:{cnt} hits:{hits} avg:{avg}"
             
     echo "cnt=", cnt, " hits=", hits
-#for (k,v) in QueryItr ^RSSItemVec.kv:
-#    echo k, ", ", v.len

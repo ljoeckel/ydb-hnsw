@@ -662,7 +662,7 @@ proc packInt8*(xs: openArray[int8]): string =
   if xs.len > 0:
     copyMem(result[0].addr, xs[0].unsafeAddr, xs.len)
 
-proc unpackInt8(s: string): seq[int8] =
+proc unpackInt8*(s: string): seq[int8] =
   ## Inverse of `packInt8`: one byte per dimension, `s.len` == dim.
   result = newSeqUninit[int8](s.len)
   if s.len > 0:
@@ -1048,7 +1048,7 @@ proc deriveGlobalNames(p: var HnswParams) =
 proc hnswParams*(global: string, model = DefaultModel,
                  M = 16, efConstruction = 200, efSearch = 64, seed = 1234,
                  dim = 0, quant = vqNone, quantScale = 0.0'f32,
-                 linkFmt = lfInt,
+                 linkFmt = lfUInt32,
                  cacheVectors = false, batchSize = 128): HnswParams =
   ## Configure one index: `global` is the YottaDB global (`^HNSWxxx`) and the
   ## `NODE` / `KEY` / `META` names are derived from it, so no caller spells the
@@ -1631,19 +1631,15 @@ proc repair*(ix: HnswIndex): int =
     ix.metaSet("maxLevel", $ix.maxLevel)
 
 
-proc search*(ix: HnswIndex, vec: openArray[float32], k = 5, ef = 0): seq[Hit] =
-  ## The `k` closest nodes to `vec`, nearest first.
+proc searchStored(ix: HnswIndex, q: StoredVec, k, ef: int): seq[Hit] =
+  ## The walk itself: greedy descent through the layers above 0 with `ef = 1`,
+  ## then best-first on layer 0 with `ef`/`k` candidates.
   ##
-  ## `ef` is the search candidate width (>= k); it defaults to the index's
-  ## efSearch. Larger values trade speed for recall.
+  ## Shared by `search` and `searchInt8`, which differ only in how `q` got onto
+  ## the index's grid - keeping one copy is what stops the two entry points from
+  ## drifting apart in what they return.
   if ix.entry < 0 or ix.count == 0:
     return @[]
-  var v = @vec
-  doAssert v.len == ix.dim, "vector has " & $v.len & " dims, index expects " & $ix.dim
-  normalize(v)
-  # The query goes onto the same grid as the stored vectors - otherwise the codes
-  # compared in `searchLayer` would not mean the same magnitudes.
-  let q = ix.toStored(v)
 
   let width = max(if ef > 0: ef else: ix.params.efSearch, k)
 
@@ -1656,6 +1652,115 @@ proc search*(ix: HnswIndex, vec: openArray[float32], k = 5, ef = 0): seq[Hit] =
   let w = ix.searchLayer(q, [ep], width, 0)
   for i in 0 ..< min(k, w.len):
     result.add Hit(id: w[i].id, dist: w[i].dist)
+
+
+proc search*(ix: HnswIndex, vec: openArray[float32], k = 5, ef = 0): seq[Hit] =
+  ## The `k` closest nodes to `vec`, nearest first.
+  ##
+  ## `ef` is the search candidate width (>= k); it defaults to the index's
+  ## efSearch. Larger values trade speed for recall.
+  ##
+  ## `vec` is a raw embedding; it is normalised and quantized here. When the
+  ## caller already holds the codes - a benchmark of the raw walk, or a host that
+  ## keeps its vectors quantized - go straight to `searchInt8` and skip both.
+  if ix.entry < 0 or ix.count == 0:
+    return @[]
+  var v = @vec
+  doAssert v.len == ix.dim, "vector has " & $v.len & " dims, index expects " & $ix.dim
+  normalize(v)
+  # The query goes onto the same grid as the stored vectors - otherwise the codes
+  # compared in `searchLayer` would not mean the same magnitudes.
+  let q = ix.toStored(v)
+  ix.searchStored(q, k, ef)
+
+
+proc searchInt8*(ix: HnswIndex, codes: openArray[int8], k = 5, ef = 0,
+                 scale = 0.0'f32): seq[Hit] =
+  ## `search` for a query that is *already* quantized: `codes` is what
+  ## `quantizeInt8` produced from an L2-normalised float32 query, as a host that
+  ## receives int8 vectors from its embedding side has in hand.
+  ##
+  ## Nothing is normalised or quantized here, which is the point: a benchmark of
+  ## this entry point measures the graph walk plus the int8 kernels, not the
+  ## pipeline that feeds them.
+  ##
+  ## Only an int8 storage mode can use this, and the codes have to be on the grid
+  ## the index stores: `quantScale` for `vqInt8Fixed`, the vector's own
+  ## `max|x| / 127` grid for `vqInt8`. Both the mode and the dimension are
+  ## checked, because the failure without them is not an exception - codes
+  ## compared against float32 vectors reach `simdDotI8` through an empty seq and
+  ## read past it.
+  ##
+  ## `scale` is the query's own quantization scale, and it only sets the
+  ## magnitude of the returned distances, never which ids come back or in what
+  ## order: `dist` is `1 - scale * storedScale * sum`, so a positive `scale` is
+  ## one constant factor across every candidate, and every decision in
+  ## `searchLayer` is a comparison between two of those distances. `0` - the
+  ## default - asks for the scale the index can supply itself, which is
+  ## `quantScale` for `vqInt8Fixed` (query and stored codes share the grid, so
+  ## the distances are the true cosine distances, identical to what `search`
+  ## reports for the same query) and `1` for `vqInt8`, where the grid is per
+  ## vector and only the ordering is meaningful unless the caller passes the
+  ## scale it quantized with.
+  if ix.params.quant == vqNone:
+    raise newException(ValueError,
+      "searchInt8 needs an int8 index, " & $ix.params.global & " stores " &
+      $ix.params.quant & "; build the index quantized, or use search()")
+  if codes.len != ix.dim:
+    raise newException(ValueError,
+      "query has " & $codes.len & " codes, index expects " & $ix.dim)
+  if scale < 0:
+    raise newException(ValueError,
+      "searchInt8 scale is the query's quantization scale, so > 0 (or 0 to " &
+      "take the index's own)")
+  let q = StoredVec(codes: @codes,
+                    scale: if scale > 0: scale
+                           elif ix.params.quant == vqInt8Fixed: ix.params.quantScale
+                           else: 1.0'f32)
+  ix.searchStored(q, k, ef)
+
+
+proc blobVector(ix: HnswIndex, blob: string): StoredVec =
+  ## Decode a stored vector blob - a `^...NODE` value as it comes out of YottaDB -
+  ## the way `ix.params.quant` says it was written. Exactly the decode `loadVec`
+  ## does for a neighbour: the two must not drift, or a query would be compared
+  ## on a different grid than the vectors it is compared against.
+  ##
+  ## The length has to match the mode exactly. That check is the difference
+  ## between "your blob is the wrong thing" and a walk over 388 codes that the
+  ## 384-dim kernels are then happy to read past.
+  if blob.len != ix.bytesPerVector:
+    raise newException(ValueError,
+      "query blob is " & $blob.len & " bytes, index expects " & $ix.bytesPerVector &
+      " for " & $ix.params.quant & " at dim " & $ix.dim)
+  case ix.params.quant
+  of vqNone:
+    result.floats = unpackFloats(blob)
+  of vqInt8:
+    result = unpackQVec(blob)
+  of vqInt8Fixed:
+    result.codes = unpackInt8(blob)
+    result.scale = ix.params.quantScale
+
+
+proc searchBlob*(ix: HnswIndex, blob: string, k = 5, ef = 0): seq[Hit] =
+  ## `search` with a query that is already in the form the index keeps its own
+  ## vectors in: the `^...NODE` value itself, so nothing is decoded to float32
+  ## and nothing is normalised or quantized on the way in. Mode-agnostic - it
+  ## reads `vqNone` (the float32 vector), `vqInt8` (float32 scale, then codes) and
+  ## `vqInt8Fixed` (codes alone) alike.
+  ##
+  ## This is the entry point for walking the index with a vector it already
+  ## holds, and the one that makes a benchmark measure the walk alone. Note what
+  ## it does *not* do: a `vqNone` blob is stored L2-normalised, so it is used as
+  ## it is rather than normalised again (`search` normalises its copy, and a
+  ## second pass over an already-normalised vector shifts the last bits and can
+  ## round a code differently); a `vqInt8` blob carries its own scale, so the
+  ## distances come out with the same magnitudes `search` reports.
+  ##
+  ## The blob must be exactly `bytesPerVector` long for the index's mode - see
+  ## `blobVector`, which does the check and the decode.
+  ix.searchStored(ix.blobVector(blob), k, ef)
 
 
 # ---------------------------------------------------------------------------
