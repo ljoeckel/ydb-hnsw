@@ -22,8 +22,10 @@
 ##   ^HNSWxxxMETA("quant")           vector storage mode (see below)
 ##   ^HNSWxxxMETA("qscale")          shared int8 grid, only for vqInt8Fixed
 ##   ^HNSWxxxMETA("model")           embedding model the vectors come from
+##   ^HNSWxxxMETA("linkfmt")         how LINKS stores one neighbour id, see below
 ##   ^HNSWxxxNODE(id)                the L2-normalised vector, see below
-##   ^HNSWxxxLINKS(id, layer)        neighbour ids as int64 (only if non-empty)
+##   ^HNSWxxxLINKS(id, layer)        neighbour ids, 8 or 4 bytes each
+##                                   (only if non-empty)
 ##   ^HNSWxxxLEVEL(id)               top layer of the node
 ##   ^HNSWxxxKEY(key)                node id for an external key
 ##
@@ -61,6 +63,22 @@
 ## installs through `setModelLoader` (`bert_nim.loadModel` does it when it is
 ## imported), which keeps this module free of Python - a program that never
 ## embeds, like the tests, opens indexes without loading a model.
+##
+## A neighbour id on disk is either `int64` (`lfInt`, 8 bytes, and
+## what every index built before the option existed holds) or `uint32`
+## (`lfUint32`, 4 bytes) as default. The narrow form halves the LINKS tree, which is where
+## most of a node's bytes go - a level-0 list is `2M` ids - at the cost of
+## capping the id space at 2^32 - 1, because ids come from a counter that never
+## reuses one. `add` refuses to allocate past that, so the cap is a hard error at
+## the insert that would cross it, not silent truncation.
+##
+## Like `quant` and `model`, the width is a property of the *index*, not of the
+## build: it is pinned in META with the first node, so a reopen decodes the blobs
+## the way they were written and two indexes of different widths can be open at
+## once. An index that has neighbour lists but no "linkfmt" key predates the
+## option and is `lfInt` by definition. Nothing else depends on the width -
+## `HnswIndex` keeps ids as `int` throughout and only `packLinks` / `unpackLinks`
+## see the stored form.
 ##
 ## Vectors are L2-normalised on insert, which makes cosine similarity a plain
 ## dot product and cosine distance `1 - dot`. How they are then stored is
@@ -125,6 +143,14 @@ type
     vqInt8      ## scalar-quantized, grid stored with each vector (4 + dim bytes)
     vqInt8Fixed ## scalar-quantized on one grid for the whole index (dim bytes)
 
+  LinkFmt* = enum
+    ## How an index stores a neighbour id in `^...LINKS`, see `HnswParams.linkFmt`.
+    ##
+    ## Both are decoded back into `int`; the choice only decides how many bytes a
+    ## link costs in YottaDB.
+    lfInt     ## int64, 8 bytes per id - default, and what older indexes hold
+    lfUint32  ## uint32, 4 bytes per id - halves the link tree, ids < 2^32
+
   ModelLoader* = proc(model: string): string
     ## How `openHnsw` reaches the embedding model named in `HnswParams.model`:
     ## load `model` and return the name it ends up loaded under. The host program
@@ -147,6 +173,7 @@ type
     dim*: int = 0                   ## Dimension
     quant*: VecQuant = vqNone       ## vector storage / quantization mode
     quantScale*: float32 = 0.0'f32  ## the int8 grid for vqInt8Fixed, ignored otherwise
+    linkFmt*: LinkFmt = lfUInt32    ## neighbour id width stored in LINKS, see `LinkFmt`
     cacheVectors*: bool = false     ## read every vector into memory on open, see
                                     ## `preloadVectors`
     batchSize*: int = 128           ## Default batch size for g.e. batchedIterator, etc.
@@ -306,6 +333,14 @@ proc bytesPerVector*(ix: HnswIndex): int =
     of vqInt8: 4 + ix.dim
     of vqInt8Fixed: ix.dim
 
+proc linkBytes*(fmt: LinkFmt): int =
+    ## What one stored neighbour id costs, so a level-0 list of `2M` links is
+    ## `2M * linkBytes` bytes. The width is a property of the index, not of the
+    ## process, so it has to be asked for rather than looked up.
+    case fmt
+    of lfInt: sizeof(int64)
+    of lfUint32: sizeof(uint32)
+
 
 proc packFloats(xs: openArray[float32]): string =
   result = newString(xs.len * sizeof(float32))
@@ -318,20 +353,50 @@ proc unpackFloats(s: string): seq[float32] =
   if n > 0:
     copyMem(result[0].addr, s[0].unsafeAddr, n * sizeof(float32))
 
-proc packInts(xs: openArray[int]): string =
-  result = newString(xs.len * sizeof(int64))
-  if xs.len > 0:
-    let dst = cast[ptr UncheckedArray[int64]](result[0].addr)
-    for i, x in xs:
-      dst[i] = int64(x)
+proc packLinks(fmt: LinkFmt, xs: openArray[int]): string =
+  ## One neighbour list as it goes into YottaDB, in the index's link width.
+  ##
+  ## `lfUint32` is the only place an id could be lost, and the range it can lose
+  ## it in starts at 4 billion: `add` refuses to allocate an id past `high(uint32)`
+  ## while an index is in that mode, so what is left here is the debug tripwire
+  ## for that invariant rather than the release-path guard.
+  case fmt
+  of lfInt:
+    result = newString(xs.len * sizeof(int64))
+    if xs.len > 0:
+      let dst = cast[ptr UncheckedArray[int64]](result[0].addr)
+      for i, x in xs:
+        dst[i] = int64(x)
+  of lfUint32:
+    result = newString(xs.len * sizeof(uint32))
+    if xs.len > 0:
+      let dst = cast[ptr UncheckedArray[uint32]](result[0].addr)
+      for i, x in xs:
+        doAssert x >= 0 and uint64(x) <= uint64(high(uint32))
+        dst[i] = uint32(x)
 
-proc unpackInts(s: string): seq[int] =
-  let n = s.len div sizeof(int64)
-  result = newSeqUninit[int](n)
-  if n > 0:
-    let src = cast[ptr UncheckedArray[int64]](s[0].unsafeAddr)
-    for i in 0 ..< n:
-      result[i] = int(src[i])
+proc unpackLinks(fmt: LinkFmt, s: string): seq[int] =
+  ## Inverse of `packLinks`, always back into `int` - the width is the on-disk
+  ## detail, the graph works in ids.
+  ##
+  ## Which width to use comes from the index and never from `s.len`: an `lfInt`
+  ## blob read as `lfUint32` would yield twice as many "ids", each half of a
+  ## real one, and nothing would raise.
+  case fmt
+  of lfInt:
+    let n = s.len div sizeof(int64)
+    result = newSeqUninit[int](n)
+    if n > 0:
+      let src = cast[ptr UncheckedArray[int64]](s[0].unsafeAddr)
+      for i in 0 ..< n:
+        result[i] = int(src[i])
+  of lfUint32:
+    let n = s.len div sizeof(uint32)
+    result = newSeqUninit[int](n)
+    if n > 0:
+      let src = cast[ptr UncheckedArray[uint32]](s[0].unsafeAddr)
+      for i in 0 ..< n:
+        result[i] = int(src[i])
 
 
 # ---------------------------------------------------------------------------
@@ -597,7 +662,7 @@ proc packInt8*(xs: openArray[int8]): string =
   if xs.len > 0:
     copyMem(result[0].addr, xs[0].unsafeAddr, xs.len)
 
-proc unpackInt8*(s: string): seq[int8] =
+proc unpackInt8(s: string): seq[int8] =
   ## Inverse of `packInt8`: one byte per dimension, `s.len` == dim.
   result = newSeqUninit[int8](s.len)
   if s.len > 0:
@@ -665,7 +730,7 @@ proc cacheSlot(ix: HnswIndex, id: int): int =
     -1
 
 
-proc loadVec(ix: HnswIndex, id: int): StoredVec =
+proc loadVec*(ix: HnswIndex, id: int): StoredVec =
   ## The vector of `id` as stored - from the in-process cache when there is one,
   ## otherwise one YottaDB read. In the quantized modes this never materializes
   ## float32; the codes come back as they are on disk.
@@ -932,10 +997,11 @@ proc contains*(ix: HnswIndex, key: string): bool =
 
 proc putLinks(ix: HnswIndex, id, level: int, links: openArray[int]) =
   if links.len > 0:
-    ydb_set(ix.params.globalLinks, @[$id, $level], packInts(links))
+    ydb_set(ix.params.globalLinks, @[$id, $level],
+            packLinks(ix.params.linkFmt, links))
 
 proc getLinks(ix: HnswIndex, id, level: int): seq[int] =
-  unpackInts(ydb_get(ix.params.globalLinks, @[$id, $level]))
+  unpackLinks(ix.params.linkFmt, ydb_get(ix.params.globalLinks, @[$id, $level]))
 
 proc metaSet(ix: HnswIndex, key, value: string) =
   ydb_set(ix.params.globalMeta, @[key], value)
@@ -982,18 +1048,23 @@ proc deriveGlobalNames(p: var HnswParams) =
 proc hnswParams*(global: string, model = DefaultModel,
                  M = 16, efConstruction = 200, efSearch = 64, seed = 1234,
                  dim = 0, quant = vqNone, quantScale = 0.0'f32,
+                 linkFmt = lfInt,
                  cacheVectors = false, batchSize = 128): HnswParams =
   ## Configure one index: `global` is the YottaDB global (`^HNSWxxx`) and the
   ## `NODE` / `KEY` / `META` names are derived from it, so no caller spells the
   ## layout out a second time.
   ##
-  ## `model`, `dim`, `quant` and `quantScale` only have to be right the first
-  ## time; an index that already exists keeps what META says (see `openHnsw`).
+  ## `model`, `dim`, `quant`, `quantScale` and `linkFmt` only have to be right
+  ## the first time; an index that already exists keeps what META says (see
+  ## `openHnsw`) - which is what keeps a reopen from reinterpreting blobs that
+  ## were written in the other link width.
+  ##
   ## `cacheVectors` is not stored in META and is honoured on every open, so it is
   ## the one thing here that always takes effect.
   result = HnswParams(global: global, model: model, M: M,
                       efConstruction: efConstruction, efSearch: efSearch,
                       seed: seed, dim: dim, quant: quant, quantScale: quantScale,
+                      linkFmt: linkFmt,
                       cacheVectors: cacheVectors, batchSize: batchSize)
   deriveGlobalNames(result)
 
@@ -1053,6 +1124,18 @@ proc openHnsw*(p: HnswParams): HnswIndex =
     result.params.quant = p.quant
   result.params.quantScale = result.metaGetFloat("qscale", p.quantScale)
 
+  # The link width is the same kind of thing as the storage mode: it says how the
+  # blobs in LINKS decode, so it belongs to the index and META wins over `p`.
+  # A non-empty index without the key was written before the width was
+  # configurable, i.e. as int64.
+  let storedLinkFmt = result.metaGetName("linkfmt", "")
+  if storedLinkFmt.len > 0:
+    result.params.linkFmt = parseEnum[LinkFmt](storedLinkFmt, lfInt)
+  elif result.count > 0:
+    result.params.linkFmt = lfInt
+  else:
+    result.params.linkFmt = p.linkFmt
+
   if result.params.quant == vqInt8Fixed and result.params.quantScale <= 0:
     raise newException(ValueError,
       "vqInt8Fixed needs a positive quantScale, e.g. quantizeScale(sample)")
@@ -1075,6 +1158,21 @@ proc openHnsw*(p: HnswParams): HnswIndex =
   # vectors back is O(count) round trips, hence the explicit opt-in.
   if result.params.cacheVectors:
     discard result.preloadVectors()
+
+
+proc recordLinkFmt*(ix: HnswIndex, fmt: LinkFmt) =
+  ## Declare the width of the neighbour lists that are already in the database,
+  ## recording it in META and in `ix` - for an index whose `^...LINKS` blobs were
+  ## converted in place (every value rewritten from int64 to uint32) and which
+  ## therefore has nothing in META to say so.
+  ##
+  ## This writes the key and nothing else: it does not convert one blob. The
+  ## index has to *be* in `fmt` already, because reading a uint32 list as `lfInt`
+  ## does not raise - it returns half as many ids, each one a pair of real ones,
+  ## and the graph quietly stops being the one that was built. Ordinary indexes
+  ## never need this: `add` pins the width with the first node.
+  ix.params.linkFmt = fmt
+  ix.metaSet("linkfmt", $fmt)
 
 
 proc hasId*(ix: HnswIndex, id: int): bool =
@@ -1249,6 +1347,14 @@ proc add*(ix: HnswIndex, vec: openArray[float32], key = ""): int =
   ## `vec` is copied before it is normalised, so the caller's seq is untouched.
   let id = ix.count
 
+  # Under `lfUint32` the id has to fit in a link. Ids are handed out in
+  # increasing order and never reused, so this one check covers every later link
+  # write as well: a neighbour's id is always below the id being inserted.
+  if ix.params.linkFmt == lfUint32 and uint64(id) > uint64(high(uint32)):
+    raise newException(ValueError,
+      "id " & $id & " does not fit linkFmt = lfUint32; reopen the index with " &
+      "lfInt, or rebuild it into a new global")
+
   var v = @vec
   if ix.dim == 0:
     ix.dim = v.len
@@ -1278,6 +1384,7 @@ proc add*(ix: HnswIndex, vec: openArray[float32], key = ""): int =
     ix.metaSet("quant", $ix.params.quant)
     if ix.params.quant == vqInt8Fixed:
       ix.metaSet("qscale", $ix.params.quantScale)
+    ix.metaSet("linkfmt", $ix.params.linkFmt)
     if ix.params.model.len > 0:
       ix.metaSet("model", ix.params.model)
 

@@ -1,5 +1,5 @@
 import std/[strutils, strformat]
-import ydbhnsw
+import ../ydbhnsw
 
 let params = hnswParams("^HNSWArticles")
 echo &"Opening the HNSW index with {params}"
@@ -28,4 +28,4 @@ proc deleteIndex(indexName: string) =
 
 #repair()
 #checkKey()
-#deleteIndex("^HNSWArticles")
+deleteIndex("^HNSWArticles")

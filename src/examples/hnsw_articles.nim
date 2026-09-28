@@ -13,10 +13,8 @@
 ##   PYTHONPATH=/home/ljoeckel/bert_env/lib/python3.12/site-packages ./hnsw_articles
 
 import std/[os, strformat, strutils, times]
-import bert_nim     # nimpy glue: embed(); its own demo stays dormant
-import hnsw
-import rss_bridge
-import yottadb      # only for --reset (dropping the target index)
+import ../ydbhnsw
+import hnsw_common
 
 const
     DefaultIndex = "^HNSWArticles"
