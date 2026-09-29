@@ -1,8 +1,8 @@
 ## Scratch test for the deletion path: synthetic vectors, no Python, scratch
 ## globals ^HNSWTEST* so the real index is untouched.
-import std/[random, strformat, strutils]
+import std/[random, strformat]
 import yottadb
-import hnsw
+import ../hnsw
 
 const Global = "^HNSWTEST"
 const Dim = 8
@@ -20,9 +20,12 @@ proc selfRetrievalOk(ix: HnswIndex, vecs: seq[seq[float32]]): bool =
   true
 
 # Raw blob access to the link lists, so the test can strand a node by hand the
-# way an un-repaired delete would leave it.
+# way an un-repaired delete would leave it. The library keeps links in their own
+# global now (`^...LINKS(id, layer)`, see `HnswParams.globalLinks`), and the
+# helpers below speak int64 - which is why `params` pins `linkFmt = lfInt`
+# instead of taking the default.
 proc readLinks(ix: HnswIndex, id, layer: int): seq[int] =
-  let s = ydb_get(ix.params.globalNode, @[$id, "links", $layer])
+  let s = ydb_get(ix.params.globalLinks, @[$id, $layer])
   let n = s.len div sizeof(int64)
   result = newSeq[int](n)
   if n > 0:
@@ -32,25 +35,30 @@ proc readLinks(ix: HnswIndex, id, layer: int): seq[int] =
 
 proc writeLinks(ix: HnswIndex, id, layer: int, links: seq[int]) =
   if links.len == 0:
-    ydb_delete(ix.params.globalNode, @[$id, "links", $layer], YDB_DEL_NODE)
+    ydb_delete(ix.params.globalLinks, @[$id, $layer], YDB_DEL_NODE)
   else:
     var blob = newString(links.len * sizeof(int64))
     let dst = cast[ptr UncheckedArray[int64]](blob[0].addr)
     for i, x in links:
       dst[i] = int64(x)
-    ydb_set(ix.params.globalNode, @[$id, "links", $layer], blob)
+    ydb_set(ix.params.globalLinks, @[$id, $layer], blob)
 
-proc levelOfRaw(ix: HnswIndex, id: int): int =
-  parseInt(ydb_get(ix.params.globalNode, @[$id, "level"]))
+proc resetIndex(params: HnswParams) =
+  ## Every tree the index owns - not just the three `add` writes. `LINKS` and
+  ## `LEVEL` left over from an earlier run are still readable, and a stale level
+  ## puts a freshly added node on a layer whose link list was never written.
+  for g in [params.globalNode, params.globalKey, params.globalMeta,
+            params.globalLinks, params.globalLevel]:
+    ydb_delete(g, @[], YDB_DEL_TREE)
 
 when isMainModule:
   # The scratch index this test works on, configured once: `hnswParams` derives
   # the ^...NODE/KEY/META names, so the cleanups below, the three opens and the
   # raw NODE access in the helpers all address the same globals.
-  let params = hnswParams(Global, M = 8, efConstruction = 32, efSearch = 64)
+  let params = hnswParams(Global, M = 8, efConstruction = 32, efSearch = 64,
+                          linkFmt = lfInt)
 
-  for g in [params.globalNode, params.globalKey, params.globalMeta]:
-    ydb_delete(g, @[], YDB_DEL_TREE)
+  resetIndex(params)
 
   var rng = initRand(42)
   var vecs: seq[seq[float32]]
@@ -71,8 +79,9 @@ when isMainModule:
   # --- repair: strand a node by hand, then let repair re-link it -------------
   echo "repair() on a healthy index (expect 0) : ", ix.repair()
   let victim = 21
-  for l in 0 .. levelOfRaw(ix, victim):
-    writeLinks(ix, victim, l, @[])
+  # A node's own list is the only index of who it points at, so dropping its
+  # whole per-node tree strands it on every layer at once.
+  ydb_delete(params.globalLinks, @[$victim], YDB_DEL_TREE)
   echo &"stripped node {victim}: L0 links now {readLinks(ix, victim, 0).len}"
   echo "self-retrieval while stranded  : ", selfRetrievalOk(ix, vecs)
   echo "repair() re-linked layers      : ", ix.repair()
@@ -133,8 +142,7 @@ when isMainModule:
   # --- delete-time repair: neighbour whose *only* link is the deleted node ----
   # (a fresh index, so this does not depend on how the graph above happened to
   # come out; nodes 0 and 1 are wired to point at each other only)
-  for g in [params.globalNode, params.globalKey, params.globalMeta]:
-    ydb_delete(g, @[], YDB_DEL_TREE)
+  resetIndex(params)
   var ix3 = openHnsw(params)
   for i in 0 ..< 6:
     discard ix3.add(vecs[i], key = "n" & $i)
@@ -145,6 +153,5 @@ when isMainModule:
   echo &"after deleting node 1: node 0 L0 links = {readLinks(ix3, 0, 0)} " &
        &"(re-linked by delete itself)"
 
-  for g in [params.globalNode, params.globalKey, params.globalMeta]:
-    ydb_delete(g, @[], YDB_DEL_TREE)
+  resetIndex(params)
   echo "scratch globals cleaned up"

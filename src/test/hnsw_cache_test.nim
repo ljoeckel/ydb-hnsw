@@ -15,7 +15,8 @@
 ## Run: nim c -r src/test/hnsw_cache_test.nim
 
 import std/[math, random, sequtils, strformat]
-import hnsw, yottadb
+import yottadb
+import ../hnsw
 
 const
   Dim = 64
@@ -26,7 +27,7 @@ const
   Grid = 0.0078'f32        # roughly 1/127, a plausible shared grid
 
 proc resetIndex(global: string) =
-  for g in [global.nodeGlobal, global.keyGlobal, global.metaGlobal]:
+  for g in [global & "NODE", global & "KEY", global & "META", global & "LINKS", global & "LEVEL"]:
     ydb_delete(g, @[], YDB_DEL_TREE)
 
 proc randomVecs(n: int, rng: var Rand): seq[seq[float32]] =

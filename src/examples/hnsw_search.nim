@@ -7,6 +7,7 @@ const
     BatchSize = 128
     MinDescriptionLen = 35
     MinSim = 0.90'f32
+    RemoveDups = false
 
 ## Report counters
 var empty, duplicates, skipped, queries, similar = 0
@@ -73,7 +74,7 @@ when isMainModule:
     let ix = openHnsw(params)
 
     for (cnt, id, title, vec) in enumerate(batchedRSSItemIter(ix)):
-        findDuplicates(ix, id, title, vec, remove=false)
+        findDuplicates(ix, id, title, vec, remove=RemoveDups)
         inc queries
 
         if cnt mod params.batchSize == 0:

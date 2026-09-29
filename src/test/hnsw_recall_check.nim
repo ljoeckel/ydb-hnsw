@@ -33,8 +33,8 @@
 ##   (and keep `probes` small) unless the index fits in RAM comfortably.
 
 import std/[os, strformat, strutils, sets, times]
-
-import hnsw, yottadb
+import yottadb
+import ../hnsw
 
 const
   DefaultGlobal = "^HNSWArticles"

@@ -228,6 +228,22 @@ type
                             ## +-127 by construction); a non-zero count there means
                             ## quantScale is too small and accuracy is leaking away
     rng: Rand
+    absentIds: HashSet[int] ## ids this index has already found to have no vector:
+                            ## deleted, or named by a one-way link that pruning
+                            ## left behind. A memo, not state - `count` never
+                            ## hands an id out twice, so an id that is empty here
+                            ## stays empty, and what it saves is a YottaDB read
+                            ## per stale reference in the hot path.
+                            ##
+                            ## Deliberately per index, never process-wide: an id
+                            ## going missing in one index says nothing about
+                            ## another, and a global memo leaks exactly that way
+                            ## - the entry from one index's delete makes a plain
+                            ## `loadVec` skip a live node in the next one, while
+                            ## an index with a preloaded cache still answers from
+                            ## the cache and gets it right. Two readers of the
+                            ## same globals then disagree, which is the one thing
+                            ## a mirror must not do.
     cache: VecStore         ## optional in-process copy of the vectors, see
                             ## `preloadVectors`; empty means every read goes to
                             ## YottaDB
@@ -248,7 +264,6 @@ proc cmpNeighbor(a, b: Neighbor): int = cmp(a.dist, b.dist)
 proc sim*(hit: Hit): float32 =
     1.0'f32 - hit.dist
 
-var zerosCache: HashSet[int]
 
 # ---------------------------------------------------------------------------
 # text normalization (dedup keys / embedding input)
@@ -760,12 +775,14 @@ proc loadVec*(ix: HnswIndex, id: int): StoredVec =
       copyMem(result.codes[0].addr, ix.cache.codes[base].unsafeAddr, ix.cache.dim)
     return
 
-  # Check if id is already zeros-cache (old deleted vector)
-  if id in zerosCache: 
+  # An id this index has already found empty - a deleted node reached through a
+  # one-way link. Memoised per index, so it cannot answer for another index's id
+  # space; see `absentIds`.
+  if id in ix.absentIds:
     return
   let s = ydb_get(ix.params.globalNode, @[$id])
   if s.len == 0:
-    zerosCache.incl(id) # add to zeros-cache
+    ix.absentIds.incl(id)
     return
   case ix.params.quant
   of vqNone: result.floats = unpackFloats(s)
@@ -1102,6 +1119,7 @@ proc openHnsw*(p: HnswParams): HnswIndex =
   deriveGlobalNames(result.params)
   result.rng = initRand(result.params.seed)
   result.entry = -1
+  result.absentIds = initHashSet[int]()
 
   result.params.M = result.metaGet("M", p.M)
   result.params.efConstruction = result.metaGet("efConstruction", p.efConstruction)
@@ -1548,8 +1566,12 @@ proc delete*(ix: HnswIndex, id: int): bool =
   ydb_delete(ix.params.globalNode, @[$id], YDB_DEL_NODE)
 
   # The id is gone from the cache too. The store is dense, so this leaves no hole
-  # behind: the slot goes back and the next `cachePut` reuses it.
+  # behind: the slot goes back and the next `cachePut` reuses it. Recording the id
+  # as absent is the same fact for a reader without a cache - and it spares the
+  # deletes below, and every later stale link, a YottaDB read that could only
+  # confirm the NODE value is no longer there.
   ix.cacheFree(id)
+  ix.absentIds.incl(id)
 
   dec ix.live
   ix.metaSet("live", $ix.live)
