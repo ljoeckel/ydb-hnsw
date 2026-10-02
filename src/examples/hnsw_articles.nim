@@ -184,7 +184,15 @@ when isMainModule:
         # One Data call on this index's key global: an article that is already
         # keyed is never re-embedded.
         if not ix.contains(idxref):
-            discard ix.add(embedNormalized(title), idxref)
+            # `Transaction` returns YottaDB's status: YDB_OK means the add
+            # committed, YDB_TP_ROLLBACK means it was retried MAX_RESTARTS times
+            # and then thrown away. Ignoring that would silently drop the
+            # article (and its vector) from the index, so fail loudly instead.
+            let rc = Transaction:
+                discard ix.add(embedNormalized(title), idxref)
+            if rc != YDB_OK:
+                quit &"Transaction for {idxref} on {opts.index} returned {rc} - " &
+                     &"the article was not indexed", 1
             inc added
             if added mod 500 == 0:
                 echo &"  {added} added, {cnt} seen, {ix.liveCount} nodes, {epochTime() - started:.0f} s"
