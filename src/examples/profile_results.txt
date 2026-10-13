@@ -1,0 +1,527 @@
+total executions of each stack trace:
+Entry: 1/99 Calls: 5131/20958 = 24.48% [sum: 5131; 5131/20958 = 24.48%]
+  hnsw.nim: simdDotF32 5131/20958 = 24.48%
+  hnsw.nim: dot 5492/20958 = 26.20%
+  hnsw.nim: dotStored 7182/20958 = 34.27%
+  hnsw.nim: distanceStored 7541/20958 = 35.98%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 2/99 Calls: 2468/20958 = 11.78% [sum: 7599; 7599/20958 = 36.26%]
+  hnsw.nim: loadVec 3166/20958 = 15.11%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 3/99 Calls: 2311/20958 = 11.03% [sum: 9910; 9910/20958 = 47.29%]
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 4/99 Calls: 969/20958 = 4.62% [sum: 10879; 10879/20958 = 51.91%]
+  heapqueue.nim: [] 1880/20958 = 8.97%
+  heapqueue.nim: siftdownToBottom 2408/20958 = 11.49%
+  heapqueue.nim: pop 3049/20958 = 14.55%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 5/99 Calls: 687/20958 = 3.28% [sum: 11566; 11566/20958 = 55.19%]
+  hnsw.nim: isMissing 1021/20958 = 4.87%
+  hnsw.nim: dotStored 7182/20958 = 34.27%
+  hnsw.nim: distanceStored 7541/20958 = 35.98%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 6/99 Calls: 675/20958 = 3.22% [sum: 12241; 12241/20958 = 58.41%]
+  hnsw.nim: dimOf 675/20958 = 3.22%
+  hnsw.nim: dotStored 7182/20958 = 34.27%
+  hnsw.nim: distanceStored 7541/20958 = 35.98%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 7/99 Calls: 617/20958 = 2.94% [sum: 12858; 12858/20958 = 61.35%]
+  iterators_1.nim: unpackLinks 642/20958 = 3.06%
+  hnsw.nim: getLinks 1459/20958 = 6.96%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 8/99 Calls: 534/20958 = 2.55% [sum: 13392; 13392/20958 = 63.90%]
+  hnsw.nim: seenOrMark 534/20958 = 2.55%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 9/99 Calls: 456/20958 = 2.18% [sum: 13848; 13848/20958 = 66.08%]
+  heapqueue.nim: len 710/20958 = 3.39%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 10/99 Calls: 361/20958 = 1.72% [sum: 14209; 14209/20958 = 67.80%]
+  hnsw.nim: dot 5492/20958 = 26.20%
+  hnsw.nim: dotStored 7182/20958 = 34.27%
+  hnsw.nim: distanceStored 7541/20958 = 35.98%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 11/99 Calls: 359/20958 = 1.71% [sum: 14568; 14568/20958 = 69.51%]
+  hnsw.nim: distanceStored 7541/20958 = 35.98%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 12/99 Calls: 357/20958 = 1.70% [sum: 14925; 14925/20958 = 71.21%]
+  hnsw.nim: cacheSlot 357/20958 = 1.70%
+  hnsw.nim: loadVec 3166/20958 = 15.11%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 13/99 Calls: 349/20958 = 1.67% [sum: 15274; 15274/20958 = 72.88%]
+  heapqueue.nim: siftdownToBottom 2408/20958 = 11.49%
+  heapqueue.nim: pop 3049/20958 = 14.55%
+  system.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 14/99 Calls: 343/20958 = 1.64% [sum: 15617; 15617/20958 = 74.52%]
+  heapqueue.nim: [] 1880/20958 = 8.97%
+  heapqueue.nim: siftup 1478/20958 = 7.05%
+  heapqueue.nim: push 1470/20958 = 7.01%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 15/99 Calls: 341/20958 = 1.63% [sum: 15958; 15958/20958 = 76.14%]
+  ptrarith.nim: align 420/20958 = 2.00%
+  hnsw.nim: loadVec 3166/20958 = 15.11%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 16/99 Calls: 339/20958 = 1.62% [sum: 16297; 16297/20958 = 77.76%]
+  heapqueue.nim: [] 1880/20958 = 8.97%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 17/99 Calls: 334/20958 = 1.59% [sum: 16631; 16631/20958 = 79.35%]
+  hnsw.nim: isMissing 1021/20958 = 4.87%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 18/99 Calls: 328/20958 = 1.57% [sum: 16959; 16959/20958 = 80.92%]
+  hnsw.nim: dotStored 7182/20958 = 34.27%
+  hnsw.nim: distanceStored 7541/20958 = 35.98%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 19/99 Calls: 305/20958 = 1.46% [sum: 17264; 17264/20958 = 82.37%]
+  heapqueue.nim: heapCmp 1233/20958 = 5.88%
+  heapqueue.nim: siftdownToBottom 2408/20958 = 11.49%
+  heapqueue.nim: pop 3049/20958 = 14.55%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 20/99 Calls: 298/20958 = 1.42% [sum: 17562; 17562/20958 = 83.80%]
+  hnsw.nim: < 608/20958 = 2.90%
+  heapqueue.nim: heapCmp 1233/20958 = 5.88%
+  heapqueue.nim: siftdownToBottom 2408/20958 = 11.49%
+  heapqueue.nim: pop 3049/20958 = 14.55%
+  system.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 21/99 Calls: 287/20958 = 1.37% [sum: 17849; 17849/20958 = 85.17%]
+  system.nim: pop 3049/20958 = 14.55%
+  heapqueue.nim: pop 3049/20958 = 14.55%
+  system.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 22/99 Calls: 279/20958 = 1.33% [sum: 18128; 18128/20958 = 86.50%]
+  system.nim: getLinks 1459/20958 = 6.96%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 23/99 Calls: 269/20958 = 1.28% [sum: 18397; 18397/20958 = 87.78%]
+  heapqueue.nim: push 1470/20958 = 7.01%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 24/99 Calls: 266/20958 = 1.27% [sum: 18663; 18663/20958 = 89.05%]
+  heapqueue.nim: siftup 1478/20958 = 7.05%
+  heapqueue.nim: push 1470/20958 = 7.01%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 25/99 Calls: 227/20958 = 1.08% [sum: 18890; 18890/20958 = 90.13%]
+  heapqueue.nim: heapCmp 1233/20958 = 5.88%
+  heapqueue.nim: siftup 1478/20958 = 7.05%
+  heapqueue.nim: push 1470/20958 = 7.01%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 26/99 Calls: 226/20958 = 1.08% [sum: 19116; 19116/20958 = 91.21%]
+  hnsw.nim: < 608/20958 = 2.90%
+  heapqueue.nim: heapCmp 1233/20958 = 5.88%
+  heapqueue.nim: siftup 1478/20958 = 7.05%
+  heapqueue.nim: push 1470/20958 = 7.01%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 27/99 Calls: 217/20958 = 1.04% [sum: 19333; 19333/20958 = 92.25%]
+  heapqueue.nim: pop 3049/20958 = 14.55%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 28/99 Calls: 216/20958 = 1.03% [sum: 19549; 19549/20958 = 93.28%]
+  dollars.nim: $ 231/20958 = 1.10%
+  hnsw.nim: getLinks 1459/20958 = 6.96%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 29/99 Calls: 161/20958 = 0.77% [sum: 19710; 19710/20958 = 94.05%]
+  ydbimpl.nim: ydb_get 339/20958 = 1.62%
+  hnsw.nim: getLinks 1459/20958 = 6.96%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 30/99 Calls: 155/20958 = 0.74% [sum: 19865; 19865/20958 = 94.78%]
+  heapqueue.nim: [] 1880/20958 = 8.97%
+  heapqueue.nim: siftup 1478/20958 = 7.05%
+  heapqueue.nim: siftdownToBottom 2408/20958 = 11.49%
+  heapqueue.nim: pop 3049/20958 = 14.55%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 31/99 Calls: 135/20958 = 0.64% [sum: 20000; 20000/20958 = 95.43%]
+  ydbimpl.nim: setYdbBuffer 151/20958 = 0.72%
+  ydbimpl.nim: ydb_get 339/20958 = 1.62%
+  hnsw.nim: getLinks 1459/20958 = 6.96%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 32/99 Calls: 120/20958 = 0.57% [sum: 20120; 20120/20958 = 96.00%]
+  heapqueue.nim: len 710/20958 = 3.39%
+  heapqueue.nim: push 1470/20958 = 7.01%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 33/99 Calls: 93/20958 = 0.44% [sum: 20213; 20213/20958 = 96.45%]
+  heapqueue.nim: heapCmp 1233/20958 = 5.88%
+  heapqueue.nim: siftup 1478/20958 = 7.05%
+  heapqueue.nim: siftdownToBottom 2408/20958 = 11.49%
+  heapqueue.nim: pop 3049/20958 = 14.55%
+  system.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 34/99 Calls: 84/20958 = 0.40% [sum: 20297; 20297/20958 = 96.85%]
+  hnsw.nim: < 608/20958 = 2.90%
+  heapqueue.nim: heapCmp 1233/20958 = 5.88%
+  heapqueue.nim: siftup 1478/20958 = 7.05%
+  heapqueue.nim: siftdownToBottom 2408/20958 = 11.49%
+  heapqueue.nim: pop 3049/20958 = 14.55%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 35/99 Calls: 84/20958 = 0.40% [sum: 20381; 20381/20958 = 97.25%]
+  heapqueue.nim: siftup 1478/20958 = 7.05%
+  heapqueue.nim: siftdownToBottom 2408/20958 = 11.49%
+  heapqueue.nim: pop 3049/20958 = 14.55%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 36/99 Calls: 74/20958 = 0.35% [sum: 20455; 20455/20958 = 97.60%]
+  heapqueue.nim: [] 1880/20958 = 8.97%
+  heapqueue.nim: pop 3049/20958 = 14.55%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 37/99 Calls: 71/20958 = 0.34% [sum: 20526; 20526/20958 = 97.94%]
+  heapqueue.nim: len 710/20958 = 3.39%
+  heapqueue.nim: siftdownToBottom 2408/20958 = 11.49%
+  heapqueue.nim: pop 3049/20958 = 14.55%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 38/99 Calls: 63/20958 = 0.30% [sum: 20589; 20589/20958 = 98.24%]
+  heapqueue.nim: len 710/20958 = 3.39%
+  heapqueue.nim: pop 3049/20958 = 14.55%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 39/99 Calls: 49/20958 = 0.23% [sum: 20638; 20638/20958 = 98.47%]
+  hnsw.nim: cacheReserve 53/20958 = 0.25%
+  hnsw.nim: preloadVectors 156/20958 = 0.74%
+  hnsw.nim: openHnsw 160/20958 = 0.76%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 40/99 Calls: 31/20958 = 0.15% [sum: 20669; 20669/20958 = 98.62%]
+  system.nim: cacheVector 104/20958 = 0.50%
+  hnsw.nim: preloadVectors 156/20958 = 0.74%
+  hnsw.nim: openHnsw 160/20958 = 0.76%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 41/99 Calls: 28/20958 = 0.13% [sum: 20697; 20697/20958 = 98.75%]
+  system.nim: lj 20957/20958 = 100.00%
+Entry: 42/99 Calls: 25/20958 = 0.12% [sum: 20722; 20722/20958 = 98.87%]
+  ptrarith.nim: align 420/20958 = 2.00%
+  hnsw.nim: unpackLinks 642/20958 = 3.06%
+  hnsw.nim: getLinks 1459/20958 = 6.96%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 43/99 Calls: 19/20958 = 0.09% [sum: 20741; 20741/20958 = 98.96%]
+  ptrarith.nim: align 420/20958 = 2.00%
+  hnsw.nim: getLinks 1459/20958 = 6.96%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 44/99 Calls: 18/20958 = 0.09% [sum: 20759; 20759/20958 = 99.05%]
+  heapqueue.nim: initHeapQueue 18/20958 = 0.09%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 45/99 Calls: 16/20958 = 0.08% [sum: 20775; 20775/20958 = 99.13%]
+  ydbimpl.nim: ydb_get 339/20958 = 1.62%
+  hnsw.nim: cacheVector 104/20958 = 0.50%
+  hnsw.nim: preloadVectors 156/20958 = 0.74%
+  hnsw.nim: openHnsw 160/20958 = 0.76%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 46/99 Calls: 14/20958 = 0.07% [sum: 20789; 20789/20958 = 99.19%]
+  dollars.nim: $ 231/20958 = 1.10%
+  hnsw.nim: cacheVector 104/20958 = 0.50%
+  hnsw.nim: preloadVectors 156/20958 = 0.74%
+  hnsw.nim: openHnsw 160/20958 = 0.76%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 47/99 Calls: 12/20958 = 0.06% [sum: 20801; 20801/20958 = 99.25%]
+  ptrarith.nim: align 420/20958 = 2.00%
+  heapqueue.nim: push 1470/20958 = 7.01%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 48/99 Calls: 9/20958 = 0.04% [sum: 20810; 20810/20958 = 99.29%]
+  dsl.nim: resolveVar 21/20958 = 0.10%
+  dsl.nim: getx 26/20958 = 0.12%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 49/99 Calls: 9/20958 = 0.04% [sum: 20819; 20819/20958 = 99.34%]
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 50/99 Calls: 8/20958 = 0.04% [sum: 20827; 20827/20958 = 99.37%]
+  hnsw.nim: cacheInit 8/20958 = 0.04%
+  hnsw.nim: cacheVector 104/20958 = 0.50%
+  hnsw.nim: preloadVectors 156/20958 = 0.74%
+  hnsw.nim: openHnsw 160/20958 = 0.76%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 51/99 Calls: 8/20958 = 0.04% [sum: 20835; 20835/20958 = 99.41%]
+  ptrarith.nim: align 420/20958 = 2.00%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 52/99 Calls: 7/20958 = 0.03% [sum: 20842; 20842/20958 = 99.45%]
+  system.nim: ydbVar 8/20958 = 0.04%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 53/99 Calls: 7/20958 = 0.03% [sum: 20849; 20849/20958 = 99.48%]
+  iterators.nim: expandSubsContains 10/20958 = 0.05%
+  dsl.nim: resolveVar 21/20958 = 0.10%
+  dsl.nim: getx 26/20958 = 0.12%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 54/99 Calls: 7/20958 = 0.03% [sum: 20856; 20856/20958 = 99.51%]
+  alloc.nim: realloc 8/20958 = 0.04%
+  heapqueue.nim: push 1470/20958 = 7.01%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 55/99 Calls: 7/20958 = 0.03% [sum: 20863; 20863/20958 = 99.55%]
+  hashes.nim: hiXorLo 7/20958 = 0.03%
+  hashes.nim: hashWangYi1 9/20958 = 0.04%
+  hashes.nim: hash 11/20958 = 0.05%
+  hashcommon.nim: rawGet 13/20958 = 0.06%
+  setimpl.nim: exclImpl 15/20958 = 0.07%
+  sets.nim: excl 18/20958 = 0.09%
+  hnsw.nim: cacheVector 104/20958 = 0.50%
+  hnsw.nim: preloadVectors 156/20958 = 0.74%
+  hnsw.nim: openHnsw 160/20958 = 0.76%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 56/99 Calls: 7/20958 = 0.03% [sum: 20870; 20870/20958 = 99.58%]
+  ydbimpl.nim: setYdbBuffer 151/20958 = 0.72%
+  ydbimpl.nim: ydb_get 339/20958 = 1.62%
+  hnsw.nim: cacheVector 104/20958 = 0.50%
+  hnsw.nim: preloadVectors 156/20958 = 0.74%
+  hnsw.nim: openHnsw 160/20958 = 0.76%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 57/99 Calls: 6/20958 = 0.03% [sum: 20876; 20876/20958 = 99.61%]
+  ptrarith.nim: align 420/20958 = 2.00%
+  hnsw.nim: cacheVector 104/20958 = 0.50%
+  hnsw.nim: preloadVectors 156/20958 = 0.74%
+  hnsw.nim: openHnsw 160/20958 = 0.76%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 58/99 Calls: 4/20958 = 0.02% [sum: 20880; 20880/20958 = 99.63%]
+  hnsw.nim: cacheReserve 53/20958 = 0.25%
+  hnsw.nim: cacheVector 104/20958 = 0.50%
+  hnsw.nim: preloadVectors 156/20958 = 0.74%
+  hnsw.nim: openHnsw 160/20958 = 0.76%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 59/99 Calls: 4/20958 = 0.02% [sum: 20884; 20884/20958 = 99.65%]
+  ydbimpl.nim: setYdbBuffer 151/20958 = 0.72%
+  ydbimpl.nim: ydb_data 7/20958 = 0.03%
+  ydbimpl.nim: ydb_get 339/20958 = 1.62%
+  hnsw.nim: getLinks 1459/20958 = 6.96%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 60/99 Calls: 4/20958 = 0.02% [sum: 20888; 20888/20958 = 99.67%]
+  ydbimpl.nim: ydb_get 339/20958 = 1.62%
+  hnsw.nim: levelsSummary 15/20958 = 0.07%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 61/99 Calls: 3/20958 = 0.01% [sum: 20891; 20891/20958 = 99.68%]
+  ydbimpl.nim: node_traverse 5/20958 = 0.02%
+  ydbimpl.nim: ydb_node_next 5/20958 = 0.02%
+  dsl.nim: lj 20957/20958 = 100.00%
+Entry: 62/99 Calls: 3/20958 = 0.01% [sum: 20894; 20894/20958 = 99.69%]
+  hnsw.nim: blobVector 8/20958 = 0.04%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 63/99 Calls: 3/20958 = 0.01% [sum: 20897; 20897/20958 = 99.71%]
+  ydbimpl.nim: ydb_get 339/20958 = 1.62%
+  dsl.nim: lj 20957/20958 = 100.00%
+Entry: 64/99 Calls: 3/20958 = 0.01% [sum: 20900; 20900/20958 = 99.72%]
+  iterators_1.nim: levelsSummary 15/20958 = 0.07%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 65/99 Calls: 3/20958 = 0.01% [sum: 20903; 20903/20958 = 99.74%]
+  parseutils.nim: parseInt 4/20958 = 0.02%
+  parseutils.nim: parseInt 4/20958 = 0.02%
+  strutils.nim: parseInt 4/20958 = 0.02%
+  hnsw.nim: levelsSummary 15/20958 = 0.07%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 66/99 Calls: 3/20958 = 0.01% [sum: 20906; 20906/20958 = 99.75%]
+  sets.nim: excl 18/20958 = 0.09%
+  hnsw.nim: cacheVector 104/20958 = 0.50%
+  hnsw.nim: preloadVectors 156/20958 = 0.74%
+  hnsw.nim: openHnsw 160/20958 = 0.76%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 67/99 Calls: 3/20958 = 0.01% [sum: 20909; 20909/20958 = 99.77%]
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 68/99 Calls: 3/20958 = 0.01% [sum: 20912; 20912/20958 = 99.78%]
+  dsl.nim: getx 26/20958 = 0.12%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 69/99 Calls: 3/20958 = 0.01% [sum: 20915; 20915/20958 = 99.79%]
+  algorithm.nim: reverse 5/20958 = 0.02%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 70/99 Calls: 3/20958 = 0.01% [sum: 20918; 20918/20958 = 99.81%]
+  ydbimpl.nim: ydb_data 7/20958 = 0.03%
+  ydbimpl.nim: ydb_get 339/20958 = 1.62%
+  hnsw.nim: getLinks 1459/20958 = 6.96%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 71/99 Calls: 2/20958 = 0.01% [sum: 20920; 20920/20958 = 99.82%]
+  ptrarith.nim: align 420/20958 = 2.00%
+  system.nim: expandSubsContains 10/20958 = 0.05%
+  dsl.nim: resolveVar 21/20958 = 0.10%
+  dsl.nim: getx 26/20958 = 0.12%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 72/99 Calls: 2/20958 = 0.01% [sum: 20922; 20922/20958 = 99.83%]
+  hashes.nim: hash 11/20958 = 0.05%
+  hashcommon.nim: rawGet 13/20958 = 0.06%
+  setimpl.nim: exclImpl 15/20958 = 0.07%
+  sets.nim: excl 18/20958 = 0.09%
+  hnsw.nim: cacheVector 104/20958 = 0.50%
+  hnsw.nim: preloadVectors 156/20958 = 0.74%
+  hnsw.nim: openHnsw 160/20958 = 0.76%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 73/99 Calls: 2/20958 = 0.01% [sum: 20924; 20924/20958 = 99.84%]
+  setimpl.nim: exclImpl 15/20958 = 0.07%
+  sets.nim: excl 18/20958 = 0.09%
+  hnsw.nim: cacheVector 104/20958 = 0.50%
+  hnsw.nim: preloadVectors 156/20958 = 0.74%
+  hnsw.nim: openHnsw 160/20958 = 0.76%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 74/99 Calls: 2/20958 = 0.01% [sum: 20926; 20926/20958 = 99.85%]
+  ptrarith.nim: align 420/20958 = 2.00%
+  hnsw.nim: unpackFloats 4/20958 = 0.02%
+  hnsw.nim: blobVector 8/20958 = 0.04%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 75/99 Calls: 2/20958 = 0.01% [sum: 20928; 20928/20958 = 99.86%]
+  hashes.nim: hashWangYi1 9/20958 = 0.04%
+  hashes.nim: hash 11/20958 = 0.05%
+  hashcommon.nim: rawGet 13/20958 = 0.06%
+  setimpl.nim: exclImpl 15/20958 = 0.07%
+  sets.nim: excl 18/20958 = 0.09%
+  hnsw.nim: cacheVector 104/20958 = 0.50%
+  hnsw.nim: preloadVectors 156/20958 = 0.74%
+  hnsw.nim: openHnsw 160/20958 = 0.76%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 76/99 Calls: 2/20958 = 0.01% [sum: 20930; 20930/20958 = 99.87%]
+  hnsw.nim: unpackFloats 4/20958 = 0.02%
+  hnsw.nim: blobVector 8/20958 = 0.04%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 77/99 Calls: 2/20958 = 0.01% [sum: 20932; 20932/20958 = 99.88%]
+  iterators_1.nim: repeat 2/20958 = 0.01%
+  ydbimpl.nim: zeroBuffer 2/20958 = 0.01%
+  ydbimpl.nim: initBuffers 2/20958 = 0.01%
+  ydbimpl.nim: ydb_get 339/20958 = 1.62%
+  hnsw.nim: metaGet 3/20958 = 0.01%
+  hnsw.nim: openHnsw 160/20958 = 0.76%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 78/99 Calls: 2/20958 = 0.01% [sum: 20934; 20934/20958 = 99.89%]
+  ydbimpl.nim: setYdbBuffer 151/20958 = 0.72%
+  ydbimpl.nim: ydb_get 339/20958 = 1.62%
+  dsl.nim: getx 26/20958 = 0.12%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 79/99 Calls: 2/20958 = 0.01% [sum: 20936; 20936/20958 = 99.90%]
+  ydbimpl.nim: setYdbBuffer 151/20958 = 0.72%
+  ydbimpl.nim: ydb_get 339/20958 = 1.62%
+  hnsw.nim: levelsSummary 15/20958 = 0.07%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 80/99 Calls: 2/20958 = 0.01% [sum: 20938; 20938/20958 = 99.90%]
+  algorithm.nim: reverse 5/20958 = 0.02%
+  algorithm.nim: reverse 5/20958 = 0.02%
+  hnsw.nim: searchLayer 20691/20958 = 98.73%
+  hnsw.nim: searchStored 20700/20958 = 98.77%
+  hnsw.nim: searchBlob 20711/20958 = 98.82%
+  lj.nim: lj 20957/20958 = 100.00%
+Entry: 81/99 Calls: 2/20958 = 0.01% [sum: 20940; 20940/20958 = 99.91%]
+  iterators_1.nim: preloadVectors 156/20958 = 0.74%
+  hnsw.nim: openHnsw 160/20958 = 0.76%
+  lj.nim: lj 20957/20958 = 100.00%

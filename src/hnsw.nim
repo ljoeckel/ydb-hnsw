@@ -193,6 +193,30 @@ type
     codes: seq[int8]
     scale: float32
 
+  VecView* = object
+    ## A borrowed, non-owning view of one stored vector: the address of its codes
+    ## (quantized modes) or floats (vqNone), plus the scale that belongs to the
+    ## codes.
+    ##
+    ## It exists so the hot path can compare against the bytes the in-process
+    ## cache already holds. `loadVec` returns an *owned* `StoredVec` - it
+    ## allocates a seq and copies the vector into it - and `searchLayer` does one
+    ## distance with that and throws it away: on the article index a couple of
+    ## thousand 1536-byte allocations and copies per query, every one of them
+    ## discarded. A view costs a pointer and a length instead, and the distance
+    ## runs on the arena's own bytes (`dotView`, `cacheViewAt`).
+    ##
+    ## What a view costs *instead* is a lifetime rule: it points into a seq it
+    ## does not own, so it may only be used while that seq is alive - and, for
+    ## the cache arena, while the arena is not resized. `searchLayer` satisfies
+    ## both: the query outlives the call, and a search never writes a vector, so
+    ## nothing reaches `cacheReserve`/`setLen` between the first candidate and
+    ## the last.
+    floats: ptr UncheckedArray[float32]
+    codes: ptr UncheckedArray[int8]
+    scale: float32
+    dim: int
+
   VecStore = object
     ## Optional in-process copy of every vector in the index, see
     ## `preloadVectors`.
@@ -548,7 +572,11 @@ proc normalize*(v: var seq[float32]) =
       for i in 0 ..< v.len:
         v[i] = v[i] / norm
 
-proc dot(a, b: seq[float32]): float32 =
+proc dot(a, b: openArray[float32]): float32 =
+  ## The float32 distance kernel. `openArray`, not `seq`, so it can run on a
+  ## `VecView` - a slice of the cache arena or of a `StoredVec` - without either
+  ## side being copied: the SIMD body only ever needs the address and the length,
+  ## and both are already there.
   when defined(hnswSimd):
     if a.len > 0:
       return simdDotF32(cast[ptr UncheckedArray[float32]](a[0].unsafeAddr),
@@ -717,24 +745,46 @@ proc isMissing(v: StoredVec): bool =
   ## True when the id has no vector: deleted, or never written.
   v.floats.len == 0 and v.codes.len == 0
 
-proc dimOf(v: StoredVec): int =
-  if v.codes.len > 0: v.codes.len else: v.floats.len
+proc viewOf(v: StoredVec): VecView =
+  ## Borrowed view of an owning `StoredVec`: the address of its codes or floats,
+  ## and the scale that goes with the codes. Nothing is copied and nothing is
+  ## owned - the seq has to outlive the view.
+  if v.codes.len > 0:
+    result.codes = cast[ptr UncheckedArray[int8]](v.codes[0].unsafeAddr)
+    result.scale = v.scale
+    result.dim = v.codes.len
+  elif v.floats.len > 0:
+    result.floats = cast[ptr UncheckedArray[float32]](v.floats[0].unsafeAddr)
+    result.dim = v.floats.len
+
+proc dotView(a, b: VecView): float32 =
+  ## Dot product of two vectors held as views: the same `dot` / `dotInt8` kernels,
+  ## run on bytes that are already in memory (the cache arena, or a `StoredVec`)
+  ## instead of on a fresh copy of them.
+  ##
+  ## A missing vector, a length mismatch, or one side quantized where the other is
+  ## not, scores 0 (= distance 1, the farthest a pair of L2-normalised vectors can
+  ## be). `connect` runs over link lists that can still name a freed id, and that
+  ## case must not raise.
+  if a.dim == 0 or b.dim == 0 or a.dim != b.dim:
+    return 0.0'f32
+  if a.codes != nil and b.codes != nil:
+    dotInt8(toOpenArray(a.codes, 0, a.dim - 1),
+            toOpenArray(b.codes, 0, b.dim - 1), a.scale, b.scale)
+  elif a.floats != nil and b.floats != nil:
+    dot(toOpenArray(a.floats, 0, a.dim - 1),
+        toOpenArray(b.floats, 0, b.dim - 1))
+  else:
+    0.0'f32
+
+proc distanceView(a, b: VecView): float32 =
+  ## Cosine distance between two L2-normalised stored vectors, both borrowed.
+  1.0'f32 - dotView(a, b)
 
 proc dotStored(a, b: StoredVec): float32 =
-  ## Dot product of two stored vectors, in whichever form they are held: int8
-  ## multiply-adds for the quantized modes, float32 for vqNone.
-  ##
-  ## A missing vector, or a length mismatch, scores 0 (= distance 1, the farthest
-  ## a pair of L2-normalised vectors can be). `connect` runs over link lists that
-  ## can still name a freed id, and that case must not raise.
-  if a.isMissing or b.isMissing:
-    return 0.0'f32
-  if dimOf(a) != dimOf(b):
-    return 0.0'f32
-  if a.codes.len > 0:
-    dotInt8(a.codes, b.codes, a.scale, b.scale)
-  else:
-    dot(a.floats, b.floats)
+  ## `dotView` for two owning vectors - what the insert path and the
+  ## not-in-cache fallback still hand in.
+  dotView(viewOf(a), viewOf(b))
 
 proc distanceStored(a, b: StoredVec): float32 =
   ## Cosine distance between two L2-normalised stored vectors.
@@ -797,6 +847,52 @@ proc loadVec*(ix: HnswIndex, id: int): StoredVec =
   of vqInt8Fixed:
     result.scale = ix.params.quantScale
     result.codes = unpackInt8(s)
+
+proc cacheViewAt(ix: HnswIndex, slot: int): VecView =
+  ## Borrowed view of the vector in cache slot `slot` - the zero-copy half of
+  ## `loadVec`.
+  ##
+  ## Valid only while the arena is not resized, which is exactly the window a
+  ## search runs in: the walk never writes a vector, so nothing calls `setLen`
+  ## on the seqs between the first candidate and the last. `preloadVectors` and
+  ## `putVec` (which can reach `cacheReserve`) are the only things that move the
+  ## arena, and neither runs mid-search.
+  if slot < 0 or ix.cache.dim <= 0:
+    return
+  let base = slot * ix.cache.dim
+  case ix.params.quant
+  of vqNone:
+    result.floats = cast[ptr UncheckedArray[float32]](ix.cache.floats[base].unsafeAddr)
+  of vqInt8:
+    result.codes = cast[ptr UncheckedArray[int8]](ix.cache.codes[base].unsafeAddr)
+    result.scale = ix.cache.scales[slot]
+  of vqInt8Fixed:
+    result.codes = cast[ptr UncheckedArray[int8]](ix.cache.codes[base].unsafeAddr)
+    result.scale = ix.params.quantScale
+  result.dim = ix.cache.dim
+
+proc distanceAt(ix: HnswIndex, q: VecView, id: int, dist: var float32): bool {.inline.} =
+  ## Distance from the query view `q` to node `id`, and whether `id` has a vector
+  ## at all.
+  ##
+  ## The in-process cache is asked first, and a slot hit is the whole point of
+  ## `VecView`: no `newSeqUninit`, no `copyMem`, no YottaDB call - the distance
+  ## runs on the arena's own bytes. Only an id the cache does not hold falls
+  ## through to `loadVec`, which is the three cases that need it: no cache at all,
+  ## a vector another process wrote after we preloaded, and a deleted node (whose
+  ## read comes back empty, which is how "missing" is recognised).
+  ##
+  ## Returns false when the id has no vector, so a caller skips it exactly as it
+  ## did with `loadVec`'s `.isMissing`.
+  let slot = ix.cacheSlot(id)
+  if slot >= 0:
+    dist = distanceView(q, ix.cacheViewAt(slot))
+    return true
+  let ev = ix.loadVec(id)
+  if ev.isMissing:
+    return false
+  dist = distanceView(q, viewOf(ev))
+  true
 
 
 # ---------------------------------------------------------------------------
@@ -1343,6 +1439,11 @@ proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
   ## Greedy best-first search on one layer, against the *stored* vectors (codes
   ## for a quantized index). Returns the `ef` closest nodes found, sorted by
   ## increasing distance.
+  ##
+  ## Candidates are read through `distanceAt`, so a vector the in-process cache
+  ## holds is compared where it already sits - no per-candidate allocation, no
+  ## copy, no YottaDB read. The query is borrowed into a view once, before the
+  ## loop, because it is the same vector for every comparison this call makes.
   if ix.visitedStamp.len < ix.count:
     ix.visitedStamp.setLen(ix.count)   # new slots read 0, every epoch is >= 1
   inc ix.visitEpoch
@@ -1351,16 +1452,19 @@ proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
     ix.visitEpoch = 1
   let epoch = ix.visitEpoch
 
+  # The query is the same vector for every comparison in this call, so its view
+  # is taken once, here, rather than per candidate.
+  let qv = viewOf(q)
+
   var over: seq[int]
   var candidates = initHeapQueue[AscItem]()
   var results = initHeapQueue[DescItem]()
+  var d: float32
   for ep in entryPoints:
     if ep < 0 or ep >= ix.count or ix.seenOrMark(over, ep, epoch):
       continue
-    let ev = ix.loadVec(ep)
-    if ev.isMissing:
+    if not ix.distanceAt(qv, ep, d):
       continue                        # deleted id (e.g. a stale entry point)
-    let d = distanceStored(q, ev)
     candidates.push(AscItem(dist: d, id: ep))
     results.push(DescItem(dist: d, id: ep))
 
@@ -1372,12 +1476,10 @@ proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
     for e in ix.getLinks(c.id, level):
       if ix.seenOrMark(over, e, epoch):
         continue
-      let ev = ix.loadVec(e)
-      if ev.isMissing:
+      if not ix.distanceAt(qv, e, d):
         # Freed id, reached through a link that neighbour pruning left one-way.
         # Treating it as "skip" keeps deleted nodes out of the result set.
         continue
-      let d = distanceStored(q, ev)
       if results.len < ef or d < results[0].dist:
         candidates.push(AscItem(dist: d, id: e))
         results.push(DescItem(dist: d, id: e))
