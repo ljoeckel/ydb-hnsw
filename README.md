@@ -20,3 +20,6 @@ In the ./python directory check torch installation with
  pip3 install transformers
  pip3 install sentence_transformers
  pip3 install sentencepiece
+
+# Setup Nim environment
+nimble setup

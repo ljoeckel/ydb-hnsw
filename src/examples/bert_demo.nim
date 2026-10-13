@@ -10,9 +10,10 @@
 ## interpreter. Since we embed the system libpython3.12, the venv's
 ## site-packages are supplied through PYTHONPATH.
 
-import ../ydbhnsw
+#import ../ydbhnsw
 
 import nimpy
+import ../bert_nim
 
 
 when isMainModule:

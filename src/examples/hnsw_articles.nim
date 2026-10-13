@@ -12,7 +12,7 @@
 ## Needs the venv on PYTHONPATH (nimble runHnsw does that):
 ##   PYTHONPATH=/home/ljoeckel/bert_env/lib/python3.12/site-packages ./hnsw_articles
 
-import std/[os, strformat, strutils, times]
+import std/[os, strformat, strutils, times, enumerate]
 import ../ydbhnsw
 import hnsw_common
 
@@ -36,6 +36,7 @@ usage: hnsw_articles [option=value]...
                    --limit=0 with --reset empties the target and builds nothing.
   --reset          delete the target index before building. Requires an explicit
                    --index=..., because it removes every node of it.
+  --batchSize      Number of items per GPU batch
   --help           this text.
 
 Stored size per vector: none 4*dim B, int8 4+dim B, int8fixed dim B.
@@ -53,6 +54,7 @@ type
         reset: bool
         limit: int
         sample: int
+        batchSize: int
         help: bool
 
 proc parseMode(s: string): VecQuant =
@@ -75,7 +77,8 @@ proc parseArgs(): Options =
         let val = if eq < 0: "" else: a[eq + 1 .. ^1]
         case key
         of "--index":
-            if val.len == 0: quit "--index needs a global name, e.g. --index=^HNSWQ", 2
+            if val.len == 0 or not val.startsWith("^"): 
+                quit "--index needs a global name, e.g. --index=^HNSWQ", 2
             result.index = val
         of "--model":
             if val.len == 0: quit "--model needs a name, e.g. --model=all-MiniLM-L6-v2", 2
@@ -91,6 +94,7 @@ proc parseArgs(): Options =
                 result.scale = float32(parseFloat(val))
                 result.scaleAuto = false
         of "--sample": result.sample = parseInt(val)
+        of "--batchSize": result.batchSize = parseInt(val)
         of "--limit": result.limit = parseInt(val)
         of "--reset": result.reset = true
         of "--help", "-h": result.help = true
@@ -99,7 +103,7 @@ proc parseArgs(): Options =
 proc dropIndex(params: HnswParams) =
     ## `--reset`: the three globals of one index, and nothing else. The names
     ## come from the params, so they cannot drift from the ones `openHnsw` uses.
-    for g in [params.globalNode, params.globalKey, params.globalMeta]:
+    for g in [params.globalNode, params.globalKey, params.globalMeta, params.globalLevel, params.globalKey, params.globalLinks]:
         ydb_delete(g, @[], YDB_DEL_TREE)
 
 
@@ -116,11 +120,6 @@ when isMainModule:
         echo Usage
         quit 0
 
-    if opts.reset and opts.index == DefaultIndex:
-        quit &"--reset deletes every node of the target, and {DefaultIndex} is the live " &
-             &"index - name a target explicitly (--index=...), or build the new one " &
-             &"alongside it as --index={DefaultIndex}Q", 2
-
     # Graph parameters are fixed for this program; the command line only picks
     # the index, the embedding model, the storage mode and the grid. `hnswParams`
     # derives the `^...NODE/KEY/META` names, so `dropIndex` and `openHnsw` (and
@@ -129,10 +128,14 @@ when isMainModule:
     var params = hnswParams(opts.index, model = opts.model,
                             M = 16, efConstruction = 200, efSearch = 64,
                             quant = opts.quant, quantScale = opts.scale)
+    
+    if opts.batchSize > 0:
+        params.batchSize = opts.batchSize
 
     if opts.reset:
         dropIndex(params)
-        echo &"deleted {opts.index} (NODE/KEY/META)"
+        echo &"deleted {opts.index} (NODE/KEY/LEVEL/LINKS/META)"
+        quit(0)
 
     var ix: HnswIndex
     try:
@@ -146,7 +149,7 @@ when isMainModule:
             raise e
         let sampleStart = epochTime()
         var sample: seq[seq[float32]]
-        for (_, title) in RSSItemIter(opts.sample):
+        for (_, title) in RSSTitleIter():
             sample.add embedNormalized(title)
         if sample.len == 0:
             quit "no articles to sample - is ^RSSItem populated?", 1
@@ -177,31 +180,53 @@ when isMainModule:
     let started = epochTime()
     var cnt = 0
     var added = 0
-    for (idxref, title) in RSSItemIter():
+
+    for (cnt, idxref, title, vec) in enumerate(batchedRSSNewTitleIter(ix)):
+        #echo cnt, " ", idxref, " ", title, " ", vec.len
         if cnt >= opts.limit:
             break
-        inc cnt
-        # One Data call on this index's key global: an article that is already
-        # keyed is never re-embedded.
-        if not ix.contains(idxref):
-            # `Transaction` returns YottaDB's status: YDB_OK means the add
-            # committed, YDB_TP_ROLLBACK means it was retried MAX_RESTARTS times
-            # and then thrown away. Ignoring that would silently drop the
-            # article (and its vector) from the index, so fail loudly instead.
-            let rc = Transaction:
-                discard ix.add(embedNormalized(title), idxref)
-            if rc != YDB_OK:
-                quit &"Transaction for {idxref} on {opts.index} returned {rc} - " &
-                     &"the article was not indexed", 1
-            inc added
-            if added mod 500 == 0:
-                echo &"  {added} added, {cnt} seen, {ix.liveCount} nodes, {epochTime() - started:.0f} s"
-                updateDBStats("hnsw_articles")
+
+        #let rc = Transaction:
+        #    discard ix.add(embedNormalized(title), idxref)
+        #if rc != YDB_OK:
+        #    quit &"Transaction for {idxref} on {opts.index} returned {rc} - the article was not indexed", 1
+        #discard ix.add(embedNormalized(title), idxref)
+        
+        let rc = Transaction:
+            discard ix.add(vec, idxref)
+        if rc != YDB_OK:
+            quit &"Transaction for {idxref} on {opts.index} returned {rc} - the article was not indexed", 1
+
+        inc added
+        if added mod 100 == 0:
+            echo &"  {added} added, {cnt} seen, {ix.liveCount} nodes, {epochTime() - started:.0f} s"
+
+
+    # for (idxref, title) in RSSTitleIter():
+    #     if cnt >= opts.limit:
+    #         break
+    #     inc cnt
+    #     # One Data call on this index's key global: an article that is already
+    #     # keyed is never re-embedded.
+    #     if not ix.contains(idxref):
+    #         # `Transaction` returns YottaDB's status: YDB_OK means the add
+    #         # committed, YDB_TP_ROLLBACK means it was retried MAX_RESTARTS times
+    #         # and then thrown away. Ignoring that would silently drop the
+    #         # article (and its vector) from the index, so fail loudly instead.
+    #         let rc = Transaction:
+    #             discard ix.add(embedNormalized(title), idxref)
+    #         if rc != YDB_OK:
+    #             quit &"Transaction for {idxref} on {opts.index} returned {rc} - " &
+    #                  &"the article was not indexed", 1
+    #         inc added
+    #         if added mod 100 == 0:
+    #             echo &"  {added} added, {cnt} seen, {ix.liveCount} nodes, {epochTime() - started:.0f} s"
+    #             #updateDBStats("hnsw_articles")
 
     echo &"done: {added} added, {cnt} seen, live={ix.liveCount} count={ix.count} in {epochTime() - started:.0f} s"
     if ix.dim > 0:
         echo &"  {ix.params.quant}, {bytesPerVector(ix)} B/vector, {bytesPerVector(ix) * ix.liveCount} B for this index, {ix.clamped} clamped"
     echo &"  {levelsSummary(ix)}"
-    updateDBStats("hnsw_articles")
+    #updateDBStats("hnsw_articles")
 
 

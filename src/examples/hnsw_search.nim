@@ -73,7 +73,7 @@ when isMainModule:
     echo &"Opening the HNSW index with {params}"
     let ix = openHnsw(params)
 
-    for (cnt, id, title, vec) in enumerate(batchedRSSItemIter(ix)):
+    for (cnt, id, title, vec) in enumerate(batchedRSSTitleIter(ix)):
         findDuplicates(ix, id, title, vec, remove=RemoveDups)
         inc queries
 

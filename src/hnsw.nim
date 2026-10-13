@@ -121,7 +121,7 @@
 ##     (896k on that index, the difference being deletions). That is the bigger
 ##     lever, and it is what lets the kernel speed matter at all.
 
-import std/[algorithm, heapqueue, math, random, sets, strutils, unicode]
+import std/[algorithm, heapqueue, math, random, sets, times, strutils, unicode]
 import yottadb
 
 when defined(hnswSimd):
@@ -166,6 +166,7 @@ type
     globalLevel*: string            ## YottaDB global ^HNSWxxxLEVEL
     globalKey*: string              ## YottaDB global ^HNSWxxxKEY
     globalMeta*: string             ## YottaDB global ^HNSWxxxMETA
+    globalQueue*: string             ## YottaDB global ^HNSWxxxQUEUE
     M*: int = 16                    ## links per node above layer 0
     efConstruction*: int = 200      ## candidate width while inserting
     efSearch*: int = 64             ## default candidate width while searching
@@ -174,7 +175,7 @@ type
     quant*: VecQuant = vqNone       ## vector storage / quantization mode
     quantScale*: float32 = 0.0'f32  ## the int8 grid for vqInt8Fixed, ignored otherwise
     linkFmt*: LinkFmt = lfUInt32    ## neighbour id width stored in LINKS, see `LinkFmt`
-    cacheVectors*: bool = false     ## read every vector into memory on open, see
+    cacheVectors*: bool = true      ## read every vector into memory on open, see
                                     ## `preloadVectors`
     batchSize*: int = 128           ## Default batch size for g.e. batchedIterator, etc.
 
@@ -228,6 +229,12 @@ type
                             ## +-127 by construction); a non-zero count there means
                             ## quantScale is too small and accuracy is leaking away
     rng: Rand
+    visitedStamp: seq[int32] ## `searchLayer`'s visited set: one epoch stamp per
+                             ## node id (see `seenOrMark`). Ids are dense, so
+                             ## "seen this node?" is one array read; the HashSet
+                             ## this replaces was ~25% of a build profile -
+                             ## hashing a value that is already an index.
+    visitEpoch: int32        ## the stamp the current `searchLayer` uses
     absentIds: HashSet[int] ## ids this index has already found to have no vector:
                             ## deleted, or named by a one-way link that pruning
                             ## left behind. A memo, not state - `count` never
@@ -357,12 +364,12 @@ proc linkBytes*(fmt: LinkFmt): int =
     of lfUint32: sizeof(uint32)
 
 
-proc packFloats(xs: openArray[float32]): string =
+proc packFloats*(xs: openArray[float32]): string =
   result = newString(xs.len * sizeof(float32))
   if xs.len > 0:
     copyMem(result[0].addr, xs[0].unsafeAddr, xs.len * sizeof(float32))
 
-proc unpackFloats(s: string): seq[float32] =
+proc unpackFloats*(s: string): seq[float32] =
   let n = s.len div sizeof(float32)
   result = newSeqUninit[float32](n)
   if n > 0:
@@ -791,13 +798,112 @@ proc loadVec*(ix: HnswIndex, id: int): StoredVec =
     result.scale = ix.params.quantScale
     result.codes = unpackInt8(s)
 
+
+# ---------------------------------------------------------------------------
+# YottaDB accessors
+# ---------------------------------------------------------------------------
+
+proc putLevel(ix: HnswIndex, id, level: int) =
+  ydb_set(ix.params.globalLevel, @[$id], $level)
+
+proc getLevel(ix: HnswIndex, id: int): int =
+  let s = ydb_get(ix.params.globalLevel, @[$id])
+  if s.len == 0: 0 else: parseInt(s)
+
+
+proc putKey(ix: HnswIndex, key: string, id: int) =
+  if key.len > 0:
+    ydb_set(ix.params.globalKey, @[key], $id)
+    ydb_set(ix.params.globalKey, @[$id], key) # inverted
+
+proc lookup*(ix: HnswIndex, key: string): int =
+  ## Node id stored for `key`, or -1 if that key was never indexed.
+  let s = ydb_get(ix.params.globalKey, @[key])
+  if s.len == 0: -1 else: parseInt(s)
+
+proc contains*(ix: HnswIndex, key: string): bool =
+  ## Whether `key` is already indexed in *this* index. One YottaDB `Data` call
+  ## instead of a value read, so it is the cheap way to skip work for an article
+  ## that is already in the graph - and it asks the index that is being built,
+  ## not a hard-coded global.
+  ydb_data(ix.params.globalKey, @[key]) != 0
+
+proc putLinks(ix: HnswIndex, id, level: int, links: openArray[int]) =
+  if links.len > 0:
+    ydb_set(ix.params.globalLinks, @[$id, $level],
+            packLinks(ix.params.linkFmt, links))
+
+proc getLinks(ix: HnswIndex, id, level: int): seq[int] =
+  unpackLinks(ix.params.linkFmt, ydb_get(ix.params.globalLinks, @[$id, $level]))
+
+proc metaSet(ix: HnswIndex, key, value: string) =
+  ydb_set(ix.params.globalMeta, @[key], value)
+
+proc metaGet(ix: HnswIndex, key: string, default: int): int =
+  let s = ydb_get(ix.params.globalMeta, @[key])
+  if s.len == 0: default else: parseInt(s)
+
+proc metaGetFloat(ix: HnswIndex, key: string, default: float32): float32 =
+  let s = ydb_get(ix.params.globalMeta, @[key])
+  if s.len == 0: default else: float32(parseFloat(s))
+
+proc metaGetName(ix: HnswIndex, key, default: string): string =
+  ## Text META value (`quant`), with a default for keys an older index lacks.
+  let s = ydb_get(ix.params.globalMeta, @[key])
+  if s.len == 0: default else: s
+
+proc bumpLive(ix: HnswIndex, delta: int) =
+  ## Advance the shared `live` counter by `delta`, mirroring the result in
+  ## `ix.live`.
+  ##
+  ## `$INCREMENT` is atomic across processes; `inc ix.live; metaSet("live", ...)`
+  ## is not. With two writers each keeping its own copy, that read-modify-write
+  ## loses one update in two, so the recorded `live` drifts far below the number
+  ## of nodes that are really there - which is exactly the "122901 vector(s) of
+  ## 349950 id(s)" report, where the preload sweep then counted `count` vectors
+  ## and proved every id was present. `count` was already made atomic for the
+  ## same reason; this is its counterpart.
+  ##
+  ## An index built before `live` existed has no META key, and `$INCREMENT` on a
+  ## missing node starts from 0 - so seed it from what `openHnsw` worked out
+  ## (`live` == `count` in that case) before the first bump.
+  if ydb_data(ix.params.globalMeta, @["live"]) == 0:
+    ix.metaSet("live", $ix.live)
+  ix.live = ydb_increment(ix.params.globalMeta, @["live"], delta)
+
+proc maxLinks*(ix: HnswIndex, level: int): int =
+  ## Level 0 keeps twice as many links - that is where the whole graph gets
+  ## walked, so it pays for itself there.
+  if level == 0: 2 * ix.params.M else: ix.params.M
+
+
+
 # ---------------------------------------------------------------------------
 # in-process vector cache
 # ---------------------------------------------------------------------------
 
 proc cacheOn(ix: HnswIndex): bool =
-  ## Whether a cache exists at all.
-  ix.cache.idToSlot.len > 0
+  ## Whether this index mirrors its vectors in process memory - the `cacheVectors`
+  ## setting, not "the id map has entries".
+  ##
+  ## The distinction matters for an index opened while still empty: it has a
+  ## cache, it is merely empty, and the first `add` has to be able to fill it.
+  ## Keying this on `idToSlot.len` is what made a from-scratch build run its
+  ## entire first pass with the cache silently off (`cachePut` returning early)
+  ## and only start caching after a reopen.
+  ix.params.cacheVectors
+
+proc cacheInit(ix: HnswIndex) =
+  ## Bring the cache arena in line with the index's dimension.
+  ##
+  ## For an index opened with vectors the two already agree: `preloadVectors`
+  ## sized the arena from `ix.dim`, which came from META. The one case they do not
+  ## is an index that was *empty* when opened - `preloadVectors` had nothing to
+  ## size itself from and returned - and is being filled now. Without this the
+  ## first mirror write would use an arena `dim` of 0: `cacheReserve` would
+  ## allocate nothing and every vector would be copied to offset 0.
+  if ix.params.cacheVectors and ix.dim > 0 and ix.cache.dim != ix.dim:
+    ix.cache.dim = ix.dim
 
 proc cacheIds(ix: HnswIndex, count: int) =
   ## Make the id -> slot map cover every id below `count`. This is the one part
@@ -836,6 +942,8 @@ proc cachePut(ix: HnswIndex, id: int, v: StoredVec) =
   ## makes keeps the cache coherent and an insert never invalidates it.
   if not ix.cacheOn:
     return
+  
+  ix.cacheInit()
   ix.cacheIds(id + 1)
   if ix.cache.idToSlot[id] < 0:
     # A fresh id - or one whose slot a delete gave back. Reusing the freed slots
@@ -892,6 +1000,59 @@ proc cacheFree(ix: HnswIndex, id: int) =
   ix.cache.idToSlot[id] = -1
   ix.cache.nSlots = last
 
+
+proc cacheVector(ix: HnswIndex, id: int): bool =
+  ## Mirror the vector YottaDB holds at `id` into the cache, returning whether
+  ## one was loaded.
+  ##
+  ## Safe to call for any id, in any order, and idempotently: it grows `idToSlot`
+  ## to cover `id` and leaves an id that is already mirrored alone. Both matter
+  ## once a second process writes the same index - the ids it reserved arrive out
+  ## of step with our own `count`, and an id can already be present from our own
+  ## `putVec`. Writing `idToSlot[id]` without the growth first is exactly the
+  ## IndexDefect that a refresh past our own `count` used to hit.
+  ##
+  ## An id that is reserved but not written yet (the other process is mid-`add`)
+  ## yields false and takes no slot; `loadVec` falls back to YottaDB for it and a
+  ## later sweep picks it up.
+  if not ix.params.cacheVectors or id < 0:
+    return false
+  ix.cacheInit()
+  if id >= ix.cache.idToSlot.len:
+    ix.cacheIds(id + 1)
+  if ix.cache.idToSlot[id] >= 0:
+    return false
+  let s = ydb_get(ix.params.globalNode, @[$id])
+  if s.len == 0:
+    return false
+  # Validate the blob against the mode before committing a slot, so a malformed
+  # value cannot leave a slot with no owner.
+  case ix.params.quant
+  of vqNone:
+    if s.len != ix.dim * sizeof(float32): return false
+  of vqInt8:
+    if s.len != sizeof(float32) + ix.dim: return false
+  of vqInt8Fixed:
+    if s.len != ix.dim: return false
+  let slot = ix.cache.nSlots
+  ix.cacheReserve(slot + 1)
+  case ix.params.quant
+  of vqNone:
+    copyMem(ix.cache.floats[slot * ix.dim].addr, s[0].unsafeAddr, s.len)
+  of vqInt8:
+    copyMem(ix.cache.scales[slot].addr, s[0].unsafeAddr, sizeof(float32))
+    copyMem(ix.cache.codes[slot * ix.dim].addr, s[sizeof(float32)].unsafeAddr, ix.dim)
+  of vqInt8Fixed:
+    copyMem(ix.cache.codes[slot * ix.dim].addr, s[0].unsafeAddr, ix.dim)
+  ix.cache.idToSlot[id] = slot
+  ix.cache.slotToId[slot] = id
+  ix.cache.nSlots = slot + 1
+  # The id is there now; if an earlier search memoised it as absent (it was
+  # reserved but not written then), that verdict is no longer true.
+  ix.absentIds.excl(id)
+  true
+
+
 proc preloadVectors*(ix: HnswIndex): int =
   ## Read every vector into process memory, returning how many were loaded.
   ##
@@ -921,35 +1082,18 @@ proc preloadVectors*(ix: HnswIndex): int =
   # step in the loop below.
   ix.cacheReserve(max(ix.live, 1))
   echo "Preloading up to ", ix.live, " vector(s) of ", ix.count, " id(s)"
-
+  let t1 = now()
   for id in 0 ..< ix.count:
-    let s = ydb_get(ix.params.globalNode, @[$id])
-    if s.len == 0:
-      continue                      # deleted id, or never written
-    let slot = ix.cache.nSlots
-    case ix.params.quant
-    of vqNone:
-      if s.len != ix.dim * sizeof(float32):
-        continue
-      ix.cacheReserve(slot + 1)
-      copyMem(ix.cache.floats[slot * ix.dim].addr, s[0].unsafeAddr, s.len)
-    of vqInt8:
-      if s.len != sizeof(float32) + ix.dim:
-        continue
-      ix.cacheReserve(slot + 1)
-      copyMem(ix.cache.scales[slot].addr, s[0].unsafeAddr, sizeof(float32))
-      copyMem(ix.cache.codes[slot * ix.dim].addr, s[sizeof(float32)].unsafeAddr, ix.dim)
-    of vqInt8Fixed:
-      if s.len != ix.dim:
-        continue
-      ix.cacheReserve(slot + 1)
-      copyMem(ix.cache.codes[slot * ix.dim].addr, s[0].unsafeAddr, ix.dim)
-    ix.cache.idToSlot[id] = slot
-    ix.cache.slotToId[slot] = id
-    ix.cache.nSlots = slot + 1
-    inc result
+    if ix.cacheVector(id):
+      inc result
   ix.cache.complete = true
-  echo "Cache loaded with ", result, " entries."
+  # The sweep just counted exactly how many ids carry a vector - which is what
+  # `live` is meant to mean. Put the shared counter right if an earlier run's
+  # racy read-modify-write had let it drift; a consistent index is left alone.
+  if ix.live != result:
+    ix.live = result
+    ix.metaSet("live", $result)
+  echo "Cache loaded with ", result, " entries in ", $(now() - t1).inMilliseconds, " ms."
 
 proc cachedVectors*(ix: HnswIndex): int =
   ## How many vectors the in-process cache holds (0 when there is none). O(1) now
@@ -967,6 +1111,7 @@ proc putVec(ix: HnswIndex, id: int, v: StoredVec) =
     ydb_set(ix.params.globalNode, @[$id], packQVec(v.scale, v.codes))
   of vqInt8Fixed:
     ydb_set(ix.params.globalNode, @[$id], packInt8(v.codes))
+  
   ix.cachePut(id, v)
 
 proc toStored(ix: HnswIndex, v: seq[float32]): StoredVec =
@@ -983,64 +1128,6 @@ proc toStored(ix: HnswIndex, v: seq[float32]): StoredVec =
     result.scale = ix.params.quantScale
 
 
-# ---------------------------------------------------------------------------
-# YottaDB accessors
-# ---------------------------------------------------------------------------
-
-proc putLevel(ix: HnswIndex, id, level: int) =
-  ydb_set(ix.params.globalLevel, @[$id], $level)
-
-proc getLevel(ix: HnswIndex, id: int): int =
-  let s = ydb_get(ix.params.globalLevel, @[$id])
-  if s.len == 0: 0 else: parseInt(s)
-
-
-proc putKey(ix: HnswIndex, key: string, id: int) =
-  if key.len > 0:
-    ydb_set(ix.params.globalKey, @[key], $id)
-    ydb_set(ix.params.globalKey, @[$id], key) # inverted
-
-proc lookup*(ix: HnswIndex, key: string): int =
-  ## Node id stored for `key`, or -1 if that key was never indexed.
-  let s = ydb_get(ix.params.globalKey, @[key])
-  if s.len == 0: -1 else: parseInt(s)
-
-proc contains*(ix: HnswIndex, key: string): bool =
-  ## Whether `key` is already indexed in *this* index. One YottaDB `Data` call
-  ## instead of a value read, so it is the cheap way to skip work for an article
-  ## that is already in the graph - and it asks the index that is being built,
-  ## not a hard-coded global.
-  ydb_data(ix.params.globalKey, @[key]) != 0
-
-proc putLinks(ix: HnswIndex, id, level: int, links: openArray[int]) =
-  if links.len > 0:
-    ydb_set(ix.params.globalLinks, @[$id, $level],
-            packLinks(ix.params.linkFmt, links))
-
-proc getLinks(ix: HnswIndex, id, level: int): seq[int] =
-  unpackLinks(ix.params.linkFmt, ydb_get(ix.params.globalLinks, @[$id, $level]))
-
-proc metaSet(ix: HnswIndex, key, value: string) =
-  ydb_set(ix.params.globalMeta, @[key], value)
-
-proc metaGet(ix: HnswIndex, key: string, default: int): int =
-  let s = ydb_get(ix.params.globalMeta, @[key])
-  if s.len == 0: default else: parseInt(s)
-
-proc metaGetFloat(ix: HnswIndex, key: string, default: float32): float32 =
-  let s = ydb_get(ix.params.globalMeta, @[key])
-  if s.len == 0: default else: float32(parseFloat(s))
-
-proc metaGetName(ix: HnswIndex, key, default: string): string =
-  ## Text META value (`quant`), with a default for keys an older index lacks.
-  let s = ydb_get(ix.params.globalMeta, @[key])
-  if s.len == 0: default else: s
-
-proc maxLinks*(ix: HnswIndex, level: int): int =
-  ## Level 0 keeps twice as many links - that is where the whole graph gets
-  ## walked, so it pays for itself there.
-  if level == 0: 2 * ix.params.M else: ix.params.M
-
 
 # ---------------------------------------------------------------------------
 # lifecycle
@@ -1055,18 +1142,19 @@ proc setModelLoader*(loader: ModelLoader) =
 proc deriveGlobalNames(p: var HnswParams) =
   ## Fill in the `^...NODE` / `^...KEY` / `^...META` names that belong to
   ## `p.global`, unless a caller named them itself.
-
-  if p.globalNode.len == 0: p.globalNode = p.global & "NODE"
-  if p.globalLinks.len == 0: p.globalLinks = p.global & "LINKS"
-  if p.globalLevel.len == 0: p.globalLevel = p.global & "LEVEL"
-  if p.globalKey.len == 0: p.globalKey = p.global & "KEY"
-  if p.globalMeta.len == 0: p.globalMeta = p.global & "META"
+  if p.globalNode.len == 0:
+    p.globalNode = p.global & "NODE"
+    p.globalLinks = p.global & "LINKS"
+    p.globalLevel = p.global & "LEVEL"
+    p.globalKey = p.global & "KEY"
+    p.globalMeta = p.global & "META"
+    p.globalQueue = p.global & "QUEUE"
 
 proc hnswParams*(global: string, model = DefaultModel,
                  M = 16, efConstruction = 200, efSearch = 64, seed = 1234,
                  dim = 0, quant = vqNone, quantScale = 0.0'f32,
                  linkFmt = lfUInt32,
-                 cacheVectors = false, batchSize = 128): HnswParams =
+                 cacheVectors = true, batchSize = 128): HnswParams =
   ## Configure one index: `global` is the YottaDB global (`^HNSWxxx`) and the
   ## `NODE` / `KEY` / `META` names are derived from it, so no caller spells the
   ## layout out a second time.
@@ -1228,17 +1316,46 @@ proc randomLevel(ix: HnswIndex): int =
   let u = max(rand(ix.rng, 1.0), 1e-12)
   int(floor(-ln(u) * mL))
 
+proc seenOrMark(ix: HnswIndex, over: var seq[int], e: int, epoch: int32): bool {.inline.} =
+  ## True when node `e` is already visited under `epoch`; marks it and returns
+  ## false otherwise.
+  ##
+  ## Node ids are dense integers `0 ..< count`, so `visitStamp[e] == epoch`
+  ## answers "seen this node?" in one array load. The HashSet this replaces
+  ## (`hashWangYi1` + `rawGet` + `containsOrIncl`) was ~25% of a build profile -
+  ## hashing a value that is already an index. A fresh search just bumps the
+  ## epoch instead of clearing the array, so it is O(1), not O(count).
+  ##
+  ## An id at or past our `count` is a node another process allocated after we
+  ## opened (a link list can already name it). Those are rare and few, so they go
+  ## into a linear-scan `over` list rather than growing the array to their id.
+  if e >= 0 and e < ix.visitedStamp.len:
+    if ix.visitedStamp[e] == epoch: return true
+    ix.visitedStamp[e] = epoch
+    return false
+  for x in over:
+    if x == e: return true
+  over.add e
+  false
+
 proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
                  ef: int, level: int): seq[Neighbor] =
   ## Greedy best-first search on one layer, against the *stored* vectors (codes
   ## for a quantized index). Returns the `ef` closest nodes found, sorted by
   ## increasing distance.
-  var visited = initHashSet[int]()
+  if ix.visitedStamp.len < ix.count:
+    ix.visitedStamp.setLen(ix.count)   # new slots read 0, every epoch is >= 1
+  inc ix.visitEpoch
+  if ix.visitEpoch <= 0:               # wrapped after ~2^31 searches: start over
+    for i in 0 ..< ix.visitedStamp.len: ix.visitedStamp[i] = 0
+    ix.visitEpoch = 1
+  let epoch = ix.visitEpoch
+
+  var over: seq[int]
   var candidates = initHeapQueue[AscItem]()
   var results = initHeapQueue[DescItem]()
-
   for ep in entryPoints:
-    if ep < 0 or ep >= ix.count or visited.containsOrIncl(ep):
+    if ep < 0 or ep >= ix.count or ix.seenOrMark(over, ep, epoch):
       continue
     let ev = ix.loadVec(ep)
     if ev.isMissing:
@@ -1253,7 +1370,7 @@ proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
     if results.len >= ef and c.dist > results[0].dist:
       break
     for e in ix.getLinks(c.id, level):
-      if visited.containsOrIncl(e):
+      if ix.seenOrMark(over, e, epoch):
         continue
       let ev = ix.loadVec(e)
       if ev.isMissing:
@@ -1266,7 +1383,6 @@ proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
         results.push(DescItem(dist: d, id: e))
         if results.len > ef:
           discard results.pop()   # max-heap: drops the farthest
-
   # Pop the max-heap to get descending order, then reverse to ascending.
   while results.len > 0:
     let r = results.pop()
@@ -1358,12 +1474,31 @@ proc connect(ix: HnswIndex, id: int, vec: StoredVec, level: int, ep: var int) =
   ep = w[0].id
 
 proc add*(ix: HnswIndex, vec: openArray[float32], key = ""): int =
-  ## Insert one vector as a new node at the next free id (`ix.count`) and link it
-  ## into the graph, returning that id.
+  ## Insert one vector as a new node and link it into the graph, returning its
+  ## id. The id is reserved atomically from META("count"), so `add` is safe to
+  ## call from several processes that share the same index.
   ##
+  doAssert key.len > 0, "add: empty key"
+
   ## Passing `key` records the key -> node id mapping used by `lookup`/`contains`.
   ## `vec` is copied before it is normalised, so the caller's seq is untouched.
-  let id = ix.count
+  ##
+  ## The id comes from an atomic `$INCREMENT` on META("count"), never from our own
+  ## `ix.count`: several processes can be adding to the same index, each with its
+  ## own copy of it, and two of them reserving from a stale local count would
+  ## hand out the same id and overwrite each other's node. `count` is "next free
+  ## id", so the id we own is the incremented value minus one; `ix.count` is then
+  ## pulled up to it so the rest of this call sees a coherent id space.
+  let lastCount = ix.count
+  let first = lastCount == 0
+  let id = ydb_increment(ix.params.globalMeta, @["count"]) - 1
+  if id + 1 > ix.count:
+    ix.count = id + 1
+  if id > lastCount and ix.params.cacheVectors:
+    # Somebody else reserved ids we have not mirrored, so the store no longer
+    # covers the whole index: `hasId` has to ask YottaDB from here on. Only
+    # `preloadVectors` sets this back to true.
+    ix.cache.complete = false
 
   # Under `lfUint32` the id has to fit in a link. Ids are handed out in
   # increasing order and never reused, so this one check covers every later link
@@ -1395,7 +1530,7 @@ proc add*(ix: HnswIndex, vec: openArray[float32], key = ""): int =
   # the caller or from the first vector - because everything that reads the index
   # back (including `preloadVectors`) needs it, and an open that only has the
   # default 0 would otherwise find a dimension-less index.
-  if ix.count == 0:
+  if first:
     ix.metaSet("M", $ix.params.M)
     ix.metaSet("efConstruction", $ix.params.efConstruction)
     ix.metaSet("dim", $ix.dim)
@@ -1412,11 +1547,10 @@ proc add*(ix: HnswIndex, vec: openArray[float32], key = ""): int =
   ix.putKey(key, id)
 
   # `count` is the id allocator: it only ever grows, so ids freed by delete()
-  # stay holes and are never handed out again.
-  ix.count += 1
-  ix.metaSet("count", $ix.count)
-  inc ix.live
-  ix.metaSet("live", $ix.live)
+  # stay holes and are never handed out again. It was already advanced by the
+  # `$INCREMENT` above, i.e. in the shared global rather than in a private copy.
+  # `live` is bumped atomically too - see `bumpLive`.
+  ix.bumpLive(1)
 
   if ix.entry < 0:
     # First node: it becomes the entry point at its own (bootstrap) level.
@@ -1443,6 +1577,20 @@ proc add*(ix: HnswIndex, vec: openArray[float32], key = ""): int =
     ix.entry = id
     ix.metaSet("entry", $ix.entry)
     ix.metaSet("maxLevel", $ix.maxLevel)
+
+  # The gap `lastCount ..< id` is ids other processes reserved between our last
+  # add and this one. Their nodes are reachable through links and `loadVec` falls
+  # back to YottaDB for any it misses, but that read is exactly what the cache is
+  # there to avoid - so mirror them now. Our own id is already mirrored, by the
+  # `putVec` above, which is why the range stops before `id`.
+  #
+  # A reserved id whose vector is not written yet (the other process is still
+  # inside its own `add`) loads nothing; that leaves the cache short of vectors,
+  # which is why `complete` stays false and `hasId` keeps asking YottaDB instead
+  # of trusting a table with holes in it.
+  if ix.params.cacheVectors and lastCount != id:
+    for i in lastCount ..< id:
+        discard ix.cacheVector(i)
 
   return id
 
@@ -1573,8 +1721,7 @@ proc delete*(ix: HnswIndex, id: int): bool =
   ix.cacheFree(id)
   ix.absentIds.incl(id)
 
-  dec ix.live
-  ix.metaSet("live", $ix.live)
+  ix.bumpLive(-1)
 
   if ix.entry == id:
     ix.electEntry()
@@ -1662,7 +1809,6 @@ proc searchStored(ix: HnswIndex, q: StoredVec, k, ef: int): seq[Hit] =
   ## drifting apart in what they return.
   if ix.entry < 0 or ix.count == 0:
     return @[]
-
   let width = max(if ef > 0: ef else: ix.params.efSearch, k)
 
   var ep = ix.entry
@@ -1670,11 +1816,9 @@ proc searchStored(ix: HnswIndex, q: StoredVec, k, ef: int): seq[Hit] =
     let w = ix.searchLayer(q, [ep], 1, l)
     if w.len > 0:
       ep = w[0].id
-
   let w = ix.searchLayer(q, [ep], width, 0)
   for i in 0 ..< min(k, w.len):
     result.add Hit(id: w[i].id, dist: w[i].dist)
-
 
 proc search*(ix: HnswIndex, vec: openArray[float32], k = 5, ef = 0): seq[Hit] =
   ## The `k` closest nodes to `vec`, nearest first.

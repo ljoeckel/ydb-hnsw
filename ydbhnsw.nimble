@@ -12,7 +12,9 @@ requires "malebolgia >=1.3.2"
 requires "zippy >=0.10.20"
 requires "zstd >=0.9.0"
 requires "nimsimd >=1.3.0"      # distance kernels, enabled by -d:hnswSimd
+requires "nimyottadb >=0.4.8"
 requires "https://github.com/ljoeckel/nimlz4.git"
+requires "nimpy"
 
 
 # The embedded interpreter is the system libpython3.12 that nimpy dlopens, so

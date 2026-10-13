@@ -29,8 +29,9 @@
 ## every `^...NODE(id)` - which is the recall a user experiences.
 ##
 ## Run: nim c -r -d:release -p:src src/test/hnsw_recall_check.nim [global] [probes] [k] [cache]
-##   The exhaustive pass reads every reachable node per probe, so pass `cache`
-##   (and keep `probes` small) unless the index fits in RAM comfortably.
+##   The exhaustive pass reads every reachable node per probe, including its
+##   links from YottaDB. It can take a while on large indexes; pass `cache` and
+##   keep `probes` small unless the index fits in RAM comfortably.
 
 import std/[os, strformat, strutils, sets, times]
 import yottadb
@@ -112,6 +113,7 @@ proc main() =
   var windowFound = 0
 
   for (qid, vec) in sample:
+    echo &"probe {qid}: exhaustive reference (ef={live})"
     # Ground truth: no candidate window, the whole of layer 0.
     let t0 = epochTime()
     let exact = ix.search(vec, k = k, ef = live)

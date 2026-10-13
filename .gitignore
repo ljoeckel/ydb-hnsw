@@ -8,3 +8,5 @@ hnsw_search
 hnsw_articles
 hnsw_clean
 python/__pycache__/
+nimble.develop
+nimbledeps
