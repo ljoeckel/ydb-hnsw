@@ -1564,6 +1564,73 @@ proc hnswParams*(global: string, model = DefaultModel,
                       batchSize: batchSize)
   deriveGlobalNames(result)
 
+proc inferDim(ix: HnswIndex): int =
+  ## The width an index's own blobs imply.
+  ##
+  ## `META("dim")` is written when the index is created, from whatever the
+  ## *creating* process was told - and every builder in this repo opens without a
+  ## `dim` (the queue processor, `lj`, `hnsw_search`), so 0 goes in. `add` settles
+  ## the real dimension from the first vector and, until this, kept it to itself.
+  ## What is left behind is an index that can hold a million correctly shaped
+  ## vectors and still not know how wide they are, which is not a state anything
+  ## downstream can use: `bytesPerVector` comes out 0 or 4, `preloadVectors`
+  ## returns immediately (so `cacheVectors` silently does nothing) and
+  ## `blobVector` rejects the very blobs the index wrote.
+  ##
+  ## The blobs themselves say it. `bytesPerVector` is a function of the mode and
+  ## the dimension and nothing else, so it inverts exactly - there is nothing to
+  ## guess: a `vqNone` blob is a whole number of float32, a `vqInt8` blob is those
+  ## codes behind one float32 scale, a `vqInt8Fixed` blob is the codes alone.
+  ##
+  ## The width has to be the *majority* width and not merely the first one read:
+  ## this is written back to the index, and an index that is mid-rebuild, or that
+  ## has a stray value in it, must not be able to talk an open into a dimension
+  ## its vectors do not have - a wrong one is worse than none, because it is then
+  ## believed by every later open. Three quarters of the blobs have to agree, and
+  ## a mixed index is refused, leaving the explicit "expects 0 at dim 0" error in
+  ## place. (A first attempt at this did believe a two-blob reading of 101-byte
+  ## values in an index whose 742,850 vectors are all 388 bytes and wrote dim 97
+  ## into META, which is what the majority rule is here to prevent.)
+  ##
+  ## Only the low 64 ids are read: ids are handed out in order, so node 0 - or the
+  ## hole just after it - is where the first vector is, and 64 reads is nothing
+  ## next to the `preloadVectors` this unblocks.
+  ##
+  ## Call this only once `ix.params.quant` is the *index's* mode and not the
+  ## caller's: the mode is what says where the dimension sits in a blob, and the
+  ## two disagree by the scale - `vqNone` over a `vqInt8` blob divides by four. A
+  ## wrong dimension from the wrong mode is written to META and then believed by
+  ## every later open, which is worse than no dimension at all.
+  if ix.count <= 0:
+    return 0
+  var lens: seq[int]
+  for id in 0 ..< min(ix.count, 64):
+    let s = ydb_get(ix.params.globalNode, @[$id])
+    if s.len > 0:
+      lens.add s.len        # a hole is a reserved-but-unwritten or deleted id
+  if lens.len < 2:
+    return 0
+  var want = 0              # the width most of them have
+  var best = 0
+  for n in lens:
+    var c = 0
+    for m in lens:
+      if m == n: inc c
+    if c > best:
+      best = c
+      want = n
+  if best * 4 < lens.len * 3:
+    echo "NODE blobs have mixed widths (", lens.len, " read, ", best,
+         " agree); leaving META without a dimension"
+    return 0
+  case ix.params.quant
+  of vqNone:
+    if want mod sizeof(float32) == 0: want div sizeof(float32) else: 0
+  of vqInt8:
+    if want > sizeof(float32): want - sizeof(float32) else: 0
+  of vqInt8Fixed:
+    want
+
 proc openHnsw*(p: HnswParams): HnswIndex =
   ## Open (or create) the index described by `p` - the single way in, whether the
   ## params come from `hnswParams(...)` or are written out as an `HnswParams`.
@@ -1621,6 +1688,26 @@ proc openHnsw*(p: HnswParams): HnswIndex =
     result.params.quant = p.quant
   result.params.quantScale = result.metaGetFloat("qscale", p.quantScale)
 
+  # The dimension is the one piece of the index META can be missing outright, and
+  # it is only recoverable *here*, below the storage mode: the mode is what says
+  # where the dimension sits inside a blob, so inferring it while `quant` is still
+  # the caller's default reads a `vqInt8` blob as float32 and divides by four.
+  if result.dim <= 0 and result.count > 0:
+    # No usable dimension in META, but vectors that have one. Recover it instead
+    # of opening an index that cannot read its own blobs, and record it: the 0
+    # that is there is the dimension the creator was *asked* for, and every later
+    # open - this process or another - would otherwise start from 0 again. See
+    # `inferDim`. Idempotent, so a reader racing a builder writes the same value
+    # the builder would.
+    result.dim = result.inferDim()
+    if result.dim > 0:
+      result.metaSet("dim", $result.dim)
+      echo "META records no dimension; ", result.dim, " inferred from the stored vectors"
+  # `params.dim` is the dimension this process works with - META's, or the one
+  # just recovered. It is what `$ix.params` reports and what the init block below
+  # writes, so leaving the caller's 0 in it described the index wrongly.
+  result.params.dim = result.dim
+
   # The link width is the same kind of thing as the storage mode: it says how the
   # blobs in LINKS decode, so it belongs to the index and META wins over `p`.
   # A non-empty index without the key was written before the width was
@@ -1655,6 +1742,20 @@ proc openHnsw*(p: HnswParams): HnswIndex =
   # vectors back is O(count) round trips, hence the explicit opt-in.
   if result.params.cacheVectors:
     discard result.preloadVectors()
+
+  let gbl = result.params.globalMeta
+  let p = result.params
+  if ydb_data(gbl, @["M"]) == 0:  # initialize only once
+    ydb_set(gbl, @["M"], $p.M)
+    ydb_set(gbl, @["efConstruction"], $p.efConstruction)
+    ydb_set(gbl, @["dim"], $p.dim)
+    ydb_set(gbl, @["quant"], $p.quant)
+    if p.quant == vqInt8Fixed:
+        ydb_set(gbl, @["qscale"], $p.quantScale)
+    ydb_set(gbl, @["linkfmt"], $p.linkFmt)    
+    if p.model.len > 0:
+        ydb_set(gbl, @["model"], p.model)    
+
 
 
 proc recordLinkFmt*(ix: HnswIndex, fmt: LinkFmt) =
@@ -1894,7 +1995,6 @@ proc add*(ix: HnswIndex, vec: openArray[float32], key = ""): int =
   ## id", so the id we own is the incremented value minus one; `ix.count` is then
   ## pulled up to it so the rest of this call sees a coherent id space.
   let lastCount = ix.count
-  let first = lastCount == 0
   let id = ydb_increment(ix.params.globalMeta, @["count"]) - 1
   if id + 1 > ix.count:
     ix.count = id + 1
@@ -1914,7 +2014,16 @@ proc add*(ix: HnswIndex, vec: openArray[float32], key = ""): int =
 
   var v = @vec
   if ix.dim == 0:
+    # The first vector defines the index's dimension - a caller's `dim` is only a
+    # promise, and nothing checks it against the data. This is also the one moment
+    # the dimension is knowable, so META is told here: the create path in
+    # `openHnsw` can only record what the caller *asked* for, which is 0 for every
+    # builder that passes no `dim`, and an index whose dimension is not in META
+    # cannot be read back at all (see `inferDim`). Once per process: the branch
+    # needs `ix.dim` to still be 0.
     ix.dim = v.len
+    if ix.dim > 0 and ix.metaGet("dim", 0) <= 0:
+      ix.metaSet("dim", $ix.dim)
   doAssert v.len == ix.dim, "vector has " & $v.len & " dims, index expects " & $ix.dim
   normalize(v)
 
@@ -1925,25 +2034,12 @@ proc add*(ix: HnswIndex, vec: openArray[float32], key = ""): int =
   # which is what makes the quantization grid meaningful.
   let sv = ix.toStored(v)
 
-  # Persist the geometry with the first node: the graph is only valid for the M
-  # and efConstruction it was built with, so a later open() must not be able to
-  # change them (openHnsw prefers whatever the database already holds). Same for
-  # the storage mode, which decides how every vector blob in the index decodes,
-  # and for the embedding model, which decides what the vectors mean. The
-  # dimension goes here too - `ix.dim` is settled by now, whether it came from
-  # the caller or from the first vector - because everything that reads the index
-  # back (including `preloadVectors`) needs it, and an open that only has the
-  # default 0 would otherwise find a dimension-less index.
-  if first:
-    ix.metaSet("M", $ix.params.M)
-    ix.metaSet("efConstruction", $ix.params.efConstruction)
-    ix.metaSet("dim", $ix.dim)
-    ix.metaSet("quant", $ix.params.quant)
-    if ix.params.quant == vqInt8Fixed:
-      ix.metaSet("qscale", $ix.params.quantScale)
-    ix.metaSet("linkfmt", $ix.params.linkFmt)
-    if ix.params.model.len > 0:
-      ix.metaSet("model", ix.params.model)
+  # The geometry is pinned in META by `openHnsw`, and only while the index is
+  # being created: the graph is valid only for the M and efConstruction it was
+  # built with, the storage mode decides how every vector blob in it decodes, and
+  # the model decides what the vectors mean - so none of them may change on a
+  # reopen. The dimension is the one piece that is not known at creation, so
+  # `add` records it when it settles it, above.
 
   # The node's own data first: later steps look their neighbours up by id.
   ix.putVec(id, sv)
@@ -2304,7 +2400,11 @@ proc blobVector(ix: HnswIndex, blob: string): StoredVec =
   if blob.len != ix.bytesPerVector:
     raise newException(ValueError,
       "query blob is " & $blob.len & " bytes, index expects " & $ix.bytesPerVector &
-      " for " & $ix.params.quant & " at dim " & $ix.dim)
+      " for " & $ix.params.quant & " at dim " & $ix.dim &
+      (if ix.dim <= 0:
+         "; the index records no dimension (" & ix.params.globalMeta &
+         "(\"dim\") is missing or 0) and it could not be read off the stored blobs"
+       else: ""))
   case ix.params.quant
   of vqNone:
     result.floats = unpackFloats(blob)
