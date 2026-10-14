@@ -120,6 +120,15 @@
 ##     number of *live* vectors that sizes it, not the id high-water mark `count`
 ##     (896k on that index, the difference being deletions). That is the bigger
 ##     lever, and it is what lets the kernel speed matter at all.
+##
+## `HnswParams.cacheLinks` covers the rest of the round trip. The vectors are its
+## bulk, but every node the walk expands also costs one neighbour-list read - a
+## `ydb_get` plus the `$id` / `$level` subscript strings plus an `unpackLinks`
+## copy, roughly a hundred per query. That mirror is filled on demand rather than
+## preloaded (a list is read the first time it is asked for and then kept: `2M`
+## ids at layer 0, `M` per layer above it, 8 bytes each, ~13 MB for the article
+## index's 98k nodes), which is what keeps a node another process added from
+## being mistaken for a node with no links.
 
 import std/[algorithm, heapqueue, math, random, sets, times, strutils, unicode]
 import yottadb
@@ -177,6 +186,9 @@ type
     linkFmt*: LinkFmt = lfUInt32    ## neighbour id width stored in LINKS, see `LinkFmt`
     cacheVectors*: bool = true      ## read every vector into memory on open, see
                                     ## `preloadVectors`
+    cacheLinks*: bool = true        ## keep every neighbour list this process
+                                    ## touches in memory, see `linksAt`; the link
+                                    ## half of `cacheVectors`
     batchSize*: int = 128           ## Default batch size for g.e. batchedIterator, etc.
 
   Neighbor* = tuple[dist: float32, id: int]
@@ -241,6 +253,38 @@ type
     complete: bool         ## the store covers the whole index - only then may
                            ## `hasId` answer from it instead of from YottaDB
 
+  LinkStore = object
+    ## Optional in-process mirror of `^...LINKS`, see `HnswParams.cacheLinks`.
+    ##
+    ## This is the link half of `VecStore`, and the two are separate because
+    ## their shapes differ: a vector is one blob per node, a link list is one blob
+    ## per (node, layer) and almost every node has only layer 0. The table is
+    ## dense - `id * stride + level` selects a slot - because ids are dense
+    ## integers, and hashing a value that is already an index is exactly what
+    ## `seenOrMark` replaced a `HashSet` for.
+    ##
+    ## Unlike `VecStore` there is no preload and no `complete`: an entry is
+    ## mirrored the first time something asks for it, and a miss always falls back
+    ## to YottaDB. That is deliberate. `^...LINKS` has no node where the list is
+    ## empty, so in the database's eyes "not mirrored" and "no links" are the
+    ## same thing; filling lazily is what keeps a node a second writer added -
+    ## whose subscripts this process has never seen - from being read as empty.
+    ## The price is one read per distinct (node, layer) ever touched, around a
+    ## hundred per query and shared by every later one, against the `count` reads
+    ## a preload would spend on open.
+    ##
+    ## `lens` is the one field that says whether an entry is known: -1 not
+    ## mirrored (ask YottaDB), 0 mirrored and empty, n > 0 mirrored with n ids at
+    ## `offset`. `caps` is the room reserved for the entry - `2M`, the layer-0
+    ## limit and so enough for every higher layer too - so a list that grows while
+    ## the node is linked in does not have to move.
+    stride: int              ## layers per id in the table (top layer + 1)
+    ids: int                 ## ids covered: 0 ..< ids
+    lens: seq[int32]         ## -1 unknown, 0 empty, else the link count
+    caps: seq[int32]         ## arena slots reserved for the entry, 0 when none
+    offset: seq[int32]       ## arena offset of the entry, -1 when it has none
+    arena: seq[int]          ## the neighbour ids themselves
+
   HnswIndex* = ref object
     params*: HnswParams
     dim*: int
@@ -278,6 +322,9 @@ type
     cache: VecStore         ## optional in-process copy of the vectors, see
                             ## `preloadVectors`; empty means every read goes to
                             ## YottaDB
+    links: LinkStore        ## optional in-process mirror of the neighbour lists,
+                            ## see `HnswParams.cacheLinks`; empty means every read
+                            ## goes to YottaDB
 
   # Two orderings of the same pair, so `heapqueue` can serve as the
   # min-heap (candidates) and the max-heap (current best results).
@@ -924,13 +971,157 @@ proc contains*(ix: HnswIndex, key: string): bool =
   ## not a hard-coded global.
   ydb_data(ix.params.globalKey, @[key]) != 0
 
+# ---------------------------------------------------------------------------
+# in-process link mirror
+# ---------------------------------------------------------------------------
+#
+# `HnswParams.cacheLinks` keeps the neighbour lists this process has touched in
+# process memory, so expanding a node costs neither a YottaDB read nor the two
+# `$id` / `$level` subscript strings nor the `unpackLinks` copy that goes with
+# them. It is filled on demand - `linksKnown` returning -1 means "ask YottaDB",
+# which is also what keeps a node another process added correct - and it never
+# has to be invalidated wholesale, because every write this process makes goes
+# through `putLinks` or `linksForget`.
+
+proc linksIdx(ix: HnswIndex, id, level: int): int {.inline.} =
+  id * ix.links.stride + level
+
+proc linksGrow(ix: HnswIndex, id, level: int) =
+  ## Make the table cover `(id, level)`. Growth is cheap and rare: `ids` only ever
+  ## rises (a `setLen`, no re-index), and `stride` only has to rise when a node
+  ## appears on a layer above every one seen so far - a handful of times in an
+  ## index's life, because layers are logarithmic in `count`.
+  if id < ix.links.ids and level < ix.links.stride and ix.links.lens.len > 0:
+    return
+  let wantIds = max(id + 1, ix.links.ids)
+  let wantStride = max(max(level + 1, ix.links.stride), 1)
+  var lens = newSeq[int32](wantIds * wantStride)
+  var caps = newSeq[int32](wantIds * wantStride)
+  var offset = newSeq[int32](wantIds * wantStride)
+  for i in 0 ..< lens.len:
+    lens[i] = -1
+    offset[i] = -1
+  for i in 0 ..< ix.links.ids:
+    for l in 0 ..< ix.links.stride:
+      lens[i * wantStride + l] = ix.links.lens[i * ix.links.stride + l]
+      caps[i * wantStride + l] = ix.links.caps[i * ix.links.stride + l]
+      offset[i * wantStride + l] = ix.links.offset[i * ix.links.stride + l]
+  ix.links.lens = lens
+  ix.links.caps = caps
+  ix.links.offset = offset
+  ix.links.stride = wantStride
+  ix.links.ids = wantIds
+
+proc linksKnown(ix: HnswIndex, id, level: int): int32 {.inline.} =
+  ## What the mirror knows about `(id, level)`: -1 not mirrored, 0 mirrored and
+  ## empty, n > 0 mirrored with n ids.
+  if not ix.params.cacheLinks or id < 0 or level < 0 or
+     id >= ix.links.ids or level >= ix.links.stride:
+    return -1
+  ix.links.lens[linksIdx(ix, id, level)]
+
+proc linksStore(ix: HnswIndex, id, level: int, links: openArray[int]) =
+  ## Record what `(id, level)` holds. Both callers pass the truth - `putLinks`
+  ## after a successful write, the fill path with whatever YottaDB returned - so
+  ## an empty list is recorded as empty rather than erased: "no links" is a real
+  ## answer and must not be read back.
+  if not ix.params.cacheLinks or id < 0 or level < 0:
+    return
+  ix.linksGrow(id, level)
+  let i = linksIdx(ix, id, level)
+  if links.len == 0:
+    ix.links.lens[i] = 0
+    return
+  if ix.links.offset[i] < 0 or links.len > int(ix.links.caps[i]):
+    # First write for this entry - or, only for a list the index would never
+    # write itself, one longer than the room reserved, which then moves.
+    let cap = max(2 * ix.params.M, links.len)
+    ix.links.offset[i] = int32(ix.links.arena.len)
+    ix.links.caps[i] = int32(cap)
+    ix.links.arena.setLen(ix.links.arena.len + cap)
+  ix.links.lens[i] = int32(links.len)
+  copyMem(ix.links.arena[int(ix.links.offset[i])].addr, links[0].unsafeAddr,
+          links.len * sizeof(int))
+
+proc linksForget(ix: HnswIndex, id, level: int) =
+  ## `(id, level)` has no list any more - `unlink` deleting the node it emptied.
+  ## The slot is kept and recorded empty, so a later read of it does not go back
+  ## to YottaDB to be told the same thing.
+  if not ix.params.cacheLinks or id < 0 or level < 0:
+    return
+  if id < ix.links.ids and level < ix.links.stride:
+    ix.links.lens[linksIdx(ix, id, level)] = 0
+
+proc linksForgetAll(ix: HnswIndex, id: int) =
+  ## Drop every layer of `id`: the mirror's side of deleting the node's
+  ## `^...LINKS` subtree.
+  if not ix.params.cacheLinks or id < 0 or id >= ix.links.ids:
+    return
+  for l in 0 ..< ix.links.stride:
+    ix.links.lens[linksIdx(ix, id, l)] = 0
+
+proc ydbLinks(ix: HnswIndex, id, level: int): seq[int] =
+  ## One neighbour list straight from YottaDB - the read the mirror saves.
+  unpackLinks(ix.params.linkFmt, ydb_get(ix.params.globalLinks, @[$id, $level]))
+
 proc putLinks(ix: HnswIndex, id, level: int, links: openArray[int]) =
   if links.len > 0:
     ydb_set(ix.params.globalLinks, @[$id, $level],
             packLinks(ix.params.linkFmt, links))
+    ix.linksStore(id, level, links)
+
+proc linksAt(ix: HnswIndex, id, level: int,
+             spare: var seq[int]): tuple[p: ptr UncheckedArray[int], n: int] =
+  ## The neighbour list of `(id, level)` as a borrowed slice, for the walk.
+  ##
+  ## The mirror is asked first; a subscript it does not know is read from YottaDB
+  ## once and then remembered, empty or not. `spare` backs that one read - the
+  ## caller owns the buffer and reuses it across calls - so once the mirror is
+  ## warm a walk allocates nothing here at all.
+  ##
+  ## `n` is the number of ids and `p` points at the first of them; `n == 0` means
+  ## the list is empty and `p` must not be dereferenced. What `p` points at stays
+  ## valid until the next call that *writes* a link list, which a search never
+  ## makes.
+  if ix.params.cacheLinks:
+    if ix.linksKnown(id, level) < 0:
+      spare = ix.ydbLinks(id, level)
+      ix.linksStore(id, level, spare)
+    let n = int(ix.linksKnown(id, level))
+    if n <= 0:
+      return (nil, 0)
+    let off = int(ix.links.offset[linksIdx(ix, id, level)])
+    return (cast[ptr UncheckedArray[int]](ix.links.arena[off].unsafeAddr), n)
+  spare = ix.ydbLinks(id, level)
+  if spare.len == 0:
+    return (nil, 0)
+  (cast[ptr UncheckedArray[int]](spare[0].unsafeAddr), spare.len)
 
 proc getLinks(ix: HnswIndex, id, level: int): seq[int] =
-  unpackLinks(ix.params.linkFmt, ydb_get(ix.params.globalLinks, @[$id, $level]))
+  ## One neighbour list as a fresh seq: what the paths that go on to *change* it
+  ## need (`connect` pruning an overflowing list, `unlink` removing an id). The
+  ## walk does not use this - it borrows the list where it lies, through
+  ## `linksAt`.
+  var spare: seq[int]
+  let (p, n) = ix.linksAt(id, level, spare)
+  if n == 0:
+    return @[]
+  result = newSeqUninit[int](n)
+  copyMem(result[0].addr, p, n * sizeof(int))
+
+proc refreshLinks*(ix: HnswIndex) =
+  ## Drop every mirrored neighbour list, so the next read of each comes from
+  ## YottaDB again - what a long-running reader does once a *second* process has
+  ## relinked nodes in the same index.
+  ##
+  ## The mirror is written only by this process's own `putLinks` / `linksForget`,
+  ## which is exactly why it cannot see another writer: it is a copy of
+  ## `^...LINKS`, and `^...LINKS` carries no version to compare against. A process
+  ## that deliberately writes those globals itself (a migration, or a test) wants
+  ## `cacheLinks = false`; one that merely shares the index with another process
+  ## wants this. It costs nothing but the refill, one read per list actually
+  ## walked. `preloadVectors` is the same idea for the vectors.
+  ix.links = LinkStore()
 
 proc metaSet(ix: HnswIndex, key, value: string) =
   ydb_set(ix.params.globalMeta, @[key], value)
@@ -1250,7 +1441,8 @@ proc hnswParams*(global: string, model = DefaultModel,
                  M = 16, efConstruction = 200, efSearch = 64, seed = 1234,
                  dim = 0, quant = vqNone, quantScale = 0.0'f32,
                  linkFmt = lfUInt32,
-                 cacheVectors = true, batchSize = 128): HnswParams =
+                 cacheVectors = true, cacheLinks = true,
+                 batchSize = 128): HnswParams =
   ## Configure one index: `global` is the YottaDB global (`^HNSWxxx`) and the
   ## `NODE` / `KEY` / `META` names are derived from it, so no caller spells the
   ## layout out a second time.
@@ -1260,13 +1452,16 @@ proc hnswParams*(global: string, model = DefaultModel,
   ## `openHnsw`) - which is what keeps a reopen from reinterpreting blobs that
   ## were written in the other link width.
   ##
-  ## `cacheVectors` is not stored in META and is honoured on every open, so it is
-  ## the one thing here that always takes effect.
+  ## `cacheVectors` and `cacheLinks` are not stored in META and are honoured on
+  ## every open, so they are the two things here that always take effect: they say
+  ## what the process mirrors in memory (`preloadVectors`, `linksAt`), not what
+  ## the index is.
   result = HnswParams(global: global, model: model, M: M,
                       efConstruction: efConstruction, efSearch: efSearch,
                       seed: seed, dim: dim, quant: quant, quantScale: quantScale,
                       linkFmt: linkFmt,
-                      cacheVectors: cacheVectors, batchSize: batchSize)
+                      cacheVectors: cacheVectors, cacheLinks: cacheLinks,
+                      batchSize: batchSize)
   deriveGlobalNames(result)
 
 proc openHnsw*(p: HnswParams): HnswIndex =
@@ -1375,6 +1570,9 @@ proc recordLinkFmt*(ix: HnswIndex, fmt: LinkFmt) =
   ## never need this: `add` pins the width with the first node.
   ix.params.linkFmt = fmt
   ix.metaSet("linkfmt", $fmt)
+  # Every list in the mirror was decoded with the old width, so drop it rather
+  # than answer from blobs that have just been reinterpreted underneath it.
+  ix.links = LinkStore()
 
 
 proc hasId*(ix: HnswIndex, id: int): bool =
@@ -1440,10 +1638,11 @@ proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
   ## for a quantized index). Returns the `ef` closest nodes found, sorted by
   ## increasing distance.
   ##
-  ## Candidates are read through `distanceAt`, so a vector the in-process cache
-  ## holds is compared where it already sits - no per-candidate allocation, no
-  ## copy, no YottaDB read. The query is borrowed into a view once, before the
-  ## loop, because it is the same vector for every comparison this call makes.
+  ## Candidates and their neighbour lists are both read through the in-process
+  ## mirrors (`distanceAt`, `linksAt`), so a vector or a link list they hold is
+  ## used where it already sits - no per-candidate allocation, no copy, no YottaDB
+  ## read. The query is borrowed into a view once, before the loop, because it is
+  ## the same vector for every comparison this call makes.
   if ix.visitedStamp.len < ix.count:
     ix.visitedStamp.setLen(ix.count)   # new slots read 0, every epoch is >= 1
   inc ix.visitEpoch
@@ -1457,6 +1656,7 @@ proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
   let qv = viewOf(q)
 
   var over: seq[int]
+  var spare: seq[int]
   var candidates = initHeapQueue[AscItem]()
   var results = initHeapQueue[DescItem]()
   var d: float32
@@ -1473,7 +1673,9 @@ proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
     # Everything left is farther than the worst result we keep -> done.
     if results.len >= ef and c.dist > results[0].dist:
       break
-    for e in ix.getLinks(c.id, level):
+    let (lp, ln) = ix.linksAt(c.id, level, spare)
+    for k in 0 ..< ln:
+      let e = lp[k]
       if ix.seenOrMark(over, e, epoch):
         continue
       if not ix.distanceAt(qv, e, d):
@@ -1762,6 +1964,7 @@ proc unlink(ix: HnswIndex, id: int): seq[(int, int)] =
         continue                      # link was already pruned one-way
       if kept.len == 0:
         ydb_delete(ix.params.globalLinks, @[$n, $l], YDB_DEL_NODE)
+        ix.linksForget(n, l)
         result.add (n, l)
       else:
         ix.putLinks(n, l, kept)
@@ -1813,6 +2016,7 @@ proc delete*(ix: HnswIndex, id: int): bool =
 
   ydb_delete(ix.params.globalLevel, @[$id], YDB_DEL_NODE)
   ydb_delete(ix.params.globalLinks, @[$id], YDB_DEL_TREE)
+  ix.linksForgetAll(id)
   ydb_delete(ix.params.globalNode, @[$id], YDB_DEL_NODE)
 
   # The id is gone from the cache too. The store is dense, so this leaves no hole

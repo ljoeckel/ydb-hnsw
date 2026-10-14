@@ -55,8 +55,16 @@ when isMainModule:
   # The scratch index this test works on, configured once: `hnswParams` derives
   # the ^...NODE/KEY/META names, so the cleanups below, the three opens and the
   # raw NODE access in the helpers all address the same globals.
+  #
+  # `cacheLinks` is off because this test reaches behind the library: `writeLinks`
+  # and the `ydb_delete` below edit `^...LINKS` with raw YottaDB calls to strand
+  # nodes by hand, and an in-process mirror cannot see a write that does not go
+  # through it. (A real process that shares its index with another writer would
+  # call `refreshLinks` after each foreign change instead.) This is also the only
+  # way the test can still say what it means: the repair path has to be shown
+  # working against the global, not against a copy of it.
   let params = hnswParams(Global, M = 8, efConstruction = 32, efSearch = 64,
-                          linkFmt = lfInt)
+                          linkFmt = lfInt, cacheLinks = false)
 
   resetIndex(params)
 
