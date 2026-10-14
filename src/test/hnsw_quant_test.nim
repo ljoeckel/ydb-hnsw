@@ -132,7 +132,7 @@ proc rankOverlap(tag: string, vecs: seq[seq[float32]], codes: seq[seq[int8]],
   echo &"  identical top-1: {top1} / {Queries} queries"
 
 proc resetIndex(global: string) =
-  for g in [global.nodeGlobal, global.keyGlobal, global.metaGlobal]:
+  for g in [global & "NODE", global & "KEY", global & "META"]:
     ydb_delete(g, @[], YDB_DEL_TREE)
 
 proc vecBytes(ix: HnswIndex): int =

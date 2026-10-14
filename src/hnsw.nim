@@ -216,7 +216,7 @@ type
     ## distance with that and throws it away: on the article index a couple of
     ## thousand 1536-byte allocations and copies per query, every one of them
     ## discarded. A view costs a pointer and a length instead, and the distance
-    ## runs on the arena's own bytes (`dotView`, `cacheViewAt`).
+    ## runs on the arena's own bytes (`dotView`, `distanceAt`).
     ##
     ## What a view costs *instead* is a lifetime rule: it points into a seq it
     ## does not own, so it may only be used while that seq is alive - and, for
@@ -804,7 +804,18 @@ proc viewOf(v: StoredVec): VecView =
     result.floats = cast[ptr UncheckedArray[float32]](v.floats[0].unsafeAddr)
     result.dim = v.floats.len
 
-proc dotView(a, b: VecView): float32 =
+proc dotCacheF32(q, v: ptr UncheckedArray[float32], n: int): float32 {.inline.} =
+  ## The float32 kernel on two raw buffers: `dot` is still the only
+  ## implementation, this is just the shape the walk wants, with the length
+  ## already in hand.
+  dot(toOpenArray(q, 0, n - 1), toOpenArray(v, 0, n - 1))
+
+proc dotCacheI8(q: ptr UncheckedArray[int8], qs: float32,
+                v: ptr UncheckedArray[int8], vs: float32, n: int): float32 {.inline.} =
+  ## The int8 kernel on two raw buffers, with both scales in hand.
+  dotInt8(toOpenArray(q, 0, n - 1), toOpenArray(v, 0, n - 1), qs, vs)
+
+proc dotView(a, b: VecView): float32 {.inline.} =
   ## Dot product of two vectors held as views: the same `dot` / `dotInt8` kernels,
   ## run on bytes that are already in memory (the cache arena, or a `StoredVec`)
   ## instead of on a fresh copy of them.
@@ -816,15 +827,13 @@ proc dotView(a, b: VecView): float32 =
   if a.dim == 0 or b.dim == 0 or a.dim != b.dim:
     return 0.0'f32
   if a.codes != nil and b.codes != nil:
-    dotInt8(toOpenArray(a.codes, 0, a.dim - 1),
-            toOpenArray(b.codes, 0, b.dim - 1), a.scale, b.scale)
+    dotCacheI8(a.codes, a.scale, b.codes, b.scale, a.dim)
   elif a.floats != nil and b.floats != nil:
-    dot(toOpenArray(a.floats, 0, a.dim - 1),
-        toOpenArray(b.floats, 0, b.dim - 1))
+    dotCacheF32(a.floats, b.floats, a.dim)
   else:
     0.0'f32
 
-proc distanceView(a, b: VecView): float32 =
+proc distanceView(a, b: VecView): float32 {.inline.} =
   ## Cosine distance between two L2-normalised stored vectors, both borrowed.
   1.0'f32 - dotView(a, b)
 
@@ -895,29 +904,6 @@ proc loadVec*(ix: HnswIndex, id: int): StoredVec =
     result.scale = ix.params.quantScale
     result.codes = unpackInt8(s)
 
-proc cacheViewAt(ix: HnswIndex, slot: int): VecView =
-  ## Borrowed view of the vector in cache slot `slot` - the zero-copy half of
-  ## `loadVec`.
-  ##
-  ## Valid only while the arena is not resized, which is exactly the window a
-  ## search runs in: the walk never writes a vector, so nothing calls `setLen`
-  ## on the seqs between the first candidate and the last. `preloadVectors` and
-  ## `putVec` (which can reach `cacheReserve`) are the only things that move the
-  ## arena, and neither runs mid-search.
-  if slot < 0 or ix.cache.dim <= 0:
-    return
-  let base = slot * ix.cache.dim
-  case ix.params.quant
-  of vqNone:
-    result.floats = cast[ptr UncheckedArray[float32]](ix.cache.floats[base].unsafeAddr)
-  of vqInt8:
-    result.codes = cast[ptr UncheckedArray[int8]](ix.cache.codes[base].unsafeAddr)
-    result.scale = ix.cache.scales[slot]
-  of vqInt8Fixed:
-    result.codes = cast[ptr UncheckedArray[int8]](ix.cache.codes[base].unsafeAddr)
-    result.scale = ix.params.quantScale
-  result.dim = ix.cache.dim
-
 proc distanceAt(ix: HnswIndex, q: VecView, id: int, dist: var float32): bool {.inline.} =
   ## Distance from the query view `q` to node `id`, and whether `id` has a vector
   ## at all.
@@ -931,9 +917,34 @@ proc distanceAt(ix: HnswIndex, q: VecView, id: int, dist: var float32): bool {.i
   ##
   ## Returns false when the id has no vector, so a caller skips it exactly as it
   ## did with `loadVec`'s `.isMissing`.
+  ##
+  ## This is the walk's per-candidate path, so the storage mode is not re-decided
+  ## here. `q`'s form *is* the index's mode - `searchStored` builds it through
+  ## `toStored` / `blobVector`, and `searchInt8` refuses an index that disagrees -
+  ## and the arena a slot points into holds that same form. Reading it straight
+  ## through the one branch below is what keeps the `case` on `quant`, and the
+  ## `VecView` `cacheViewAt` used to build and throw away, out of the loop;
+  ## `dotView` keeps its full checks for the callers that hand it two arbitrary
+  ## vectors.
+  ##
+  ## The arena must not be resized while a returned distance is being used, which
+  ## is exactly the window a walk runs in: a search writes no vector, so nothing
+  ## reaches `cacheReserve` / `setLen` between the first candidate and the last.
   let slot = ix.cacheSlot(id)
   if slot >= 0:
-    dist = distanceView(q, ix.cacheViewAt(slot))
+    let base = slot * ix.cache.dim
+    if q.codes != nil:
+      # vqInt8 carries a scale per vector, vqInt8Fixed one for the whole index -
+      # and only the former has `cache.scales` filled in.
+      let vs = if ix.params.quant == vqInt8: ix.cache.scales[slot]
+               else: ix.params.quantScale
+      dist = 1.0'f32 - dotCacheI8(q.codes, q.scale,
+               cast[ptr UncheckedArray[int8]](ix.cache.codes[base].unsafeAddr),
+               vs, ix.cache.dim)
+    else:
+      dist = 1.0'f32 - dotCacheF32(q.floats,
+               cast[ptr UncheckedArray[float32]](ix.cache.floats[base].unsafeAddr),
+               ix.cache.dim)
     return true
   let ev = ix.loadVec(id)
   if ev.isMissing:
