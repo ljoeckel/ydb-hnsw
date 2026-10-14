@@ -1063,30 +1063,54 @@ proc linksIdx(ix: HnswIndex, id, level: int): int {.inline.} =
   id * ix.links.stride + level
 
 proc linksGrow(ix: HnswIndex, id, level: int) =
-  ## Make the table cover `(id, level)`. Growth is cheap and rare: `ids` only ever
-  ## rises (a `setLen`, no re-index), and `stride` only has to rise when a node
-  ## appears on a layer above every one seen so far - a handful of times in an
-  ## index's life, because layers are logarithmic in `count`.
+  ## Make the table cover `(id, level)`.
+  ##
+  ## Both dimensions grow *geometrically*, and that is the whole point of this
+  ## procedure. `add` hands out a fresh id for every node, so a build reaches here
+  ## once per insert; growing `ids` to "one more row" rebuilds all three tables -
+  ## three `newSeq`s plus a copy of `ids * stride` entries - on every one of them,
+  ## which is O(n^2) over the build and spends most of its life in the allocator
+  ## re-growing a table that is about to be discarded. Doubling makes it amortised
+  ## O(1) instead. Measured before this: 1559 us/insert at 10k nodes, 4804 us at
+  ## 40k (4x the nodes for 3.1x the cost per insert).
+  ##
+  ## Only a change of `stride` has to re-index, because that is the one that moves
+  ## existing entries - the row length is part of every index. It happens when a
+  ## node appears on a layer above every one seen so far, which is logarithmic in
+  ## `count`. A longer table is just a `setLen`: rows keep their place, and only
+  ## the new ones have to be marked unknown.
   if id < ix.links.ids and level < ix.links.stride and ix.links.lens.len > 0:
     return
-  let wantIds = max(id + 1, ix.links.ids)
-  let wantStride = max(max(level + 1, ix.links.stride), 1)
-  var lens = newSeq[int32](wantIds * wantStride)
-  var caps = newSeq[int32](wantIds * wantStride)
-  var offset = newSeq[int32](wantIds * wantStride)
-  for i in 0 ..< lens.len:
-    lens[i] = -1
-    offset[i] = -1
-  for i in 0 ..< ix.links.ids:
-    for l in 0 ..< ix.links.stride:
-      lens[i * wantStride + l] = ix.links.lens[i * ix.links.stride + l]
-      caps[i * wantStride + l] = ix.links.caps[i * ix.links.stride + l]
-      offset[i * wantStride + l] = ix.links.offset[i * ix.links.stride + l]
-  ix.links.lens = lens
-  ix.links.caps = caps
-  ix.links.offset = offset
-  ix.links.stride = wantStride
-  ix.links.ids = wantIds
+
+  if level >= ix.links.stride:
+    let newStride = max(max(level + 1, ix.links.stride * 2), 1)
+    let rows = ix.links.ids
+    var lens = newSeq[int32](rows * newStride)
+    var caps = newSeq[int32](rows * newStride)
+    var offset = newSeq[int32](rows * newStride)
+    for i in 0 ..< lens.len:
+      lens[i] = -1
+      offset[i] = -1
+    for i in 0 ..< rows:
+      for l in 0 ..< ix.links.stride:
+        lens[i * newStride + l] = ix.links.lens[i * ix.links.stride + l]
+        caps[i * newStride + l] = ix.links.caps[i * ix.links.stride + l]
+        offset[i * newStride + l] = ix.links.offset[i * ix.links.stride + l]
+    ix.links.lens = lens
+    ix.links.caps = caps
+    ix.links.offset = offset
+    ix.links.stride = newStride
+
+  if id >= ix.links.ids:
+    let newIds = max(max(id + 1, ix.links.ids * 2), 64)
+    let have = ix.links.ids * ix.links.stride
+    ix.links.lens.setLen(newIds * ix.links.stride)
+    ix.links.caps.setLen(newIds * ix.links.stride)
+    ix.links.offset.setLen(newIds * ix.links.stride)
+    for i in have ..< ix.links.lens.len:
+      ix.links.lens[i] = -1
+      ix.links.offset[i] = -1
+    ix.links.ids = newIds
 
 proc linksKnown(ix: HnswIndex, id, level: int): int32 {.inline.} =
   ## What the mirror knows about `(id, level)`: -1 not mirrored, 0 mirrored and

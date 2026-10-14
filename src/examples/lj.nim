@@ -15,7 +15,7 @@ when isMainModule:
     echo ix.levelsSummary()
     
     let t1 = getTime() # set start for caclulation
-
+    var t0 = gettime() # for each 100 segment
     for (subs, vs) in QueryItr ^HNSWArticlesNODE.sv: 
         let id = Get ^HNSWArticlesKEY(subs[0])
 
@@ -36,7 +36,9 @@ when isMainModule:
         inc(hitsCount, hits.len)
 
         if cnt mod 100 == 0:
+            let avg100 = (getTime() - t0).inMicroseconds / 100
             let avg = (getTime() - t1).inMicroseconds / cnt
-            echo &"cnt:{cnt} hits:{hitsCount} notSelf:{notSelfCount} avg:{avg}"
+            echo &"cnt:{cnt} hits:{hitsCount} notSelf:{notSelfCount} avg100: {avg100}, avg: {avg}"
+            t0 = getTime()
 
     echo fmt"cnt: {cnt}, hits: {hitsCount}, notSelfCount: {notSelfCount}"
