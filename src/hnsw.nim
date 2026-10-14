@@ -130,7 +130,7 @@
 ## index's 98k nodes), which is what keeps a node another process added from
 ## being mistaken for a node with no links.
 
-import std/[algorithm, heapqueue, math, random, sets, times, strutils, unicode]
+import std/[algorithm, math, random, sets, times, strutils, unicode]
 import yottadb
 
 when defined(hnswSimd):
@@ -326,17 +326,82 @@ type
                             ## see `HnswParams.cacheLinks`; empty means every read
                             ## goes to YottaDB
 
-  # Two orderings of the same pair, so `heapqueue` can serve as the
-  # min-heap (candidates) and the max-heap (current best results).
-  AscItem = object
-    dist: float32
-    id: int
-  DescItem = object
-    dist: float32
-    id: int
+  HnswHeap = object
+    ## The binary heap the walk runs on: `dists` holds the keys, `ids` the node
+    ## each key belongs to, and `n` is how many of them are live.
+    ##
+    ## `heapqueue` was costing the hot loop more than the heap is worth. It keeps
+    ## a `seq[T]` of 12-byte tuples, so consecutive comparisons land 16 bytes
+    ## apart, and every use of `.len` in the loop is a call - with
+    ## `results.len >= ef` sitting in the middle of the inner loop. Two arrays
+    ## keep the keys adjacent, `n` is a plain `int` the loop holds in a register,
+    ## and the sift moves parents into the hole instead of swapping on every
+    ## level. Nothing is ever taken out of the arrays, only `n` moves, so a push
+    ## after a pop reuses the space.
+    ##
+    ## There is one implementation and it is a min-heap. Both orderings the
+    ## search needs come from the key: `candidates` pushes `dist`, so the nearest
+    ## is on top and popped next, and `results` pushes `-dist`, so the *farthest*
+    ## is on top and evicted first. Negating a float is exact, so no ordering
+    ## changes - `worst` is the one place that convention is visible.
+    dists: seq[float32]
+    ids: seq[int]
+    n: int
 
-proc `<`(a, b: AscItem): bool = a.dist < b.dist
-proc `<`(a, b: DescItem): bool = a.dist > b.dist
+proc heapPush(h: var HnswHeap, dist: float32, id: int) {.inline.} =
+  ## Add `(dist, id)` to the min-heap `h`.
+  ##
+  ## The arena doubles, so re-heaping a whole layer's frontier does not
+  ## reallocate once per candidate.
+  if h.n == h.dists.len:
+    let cap = if h.n == 0: 64 else: h.n * 2
+    h.dists.setLen(cap)
+    h.ids.setLen(cap)
+  var i = h.n
+  inc h.n
+  # Sift up: move each parent down into the hole, then drop the new key in. A
+  # swap per level would write every entry twice.
+  while i > 0:
+    let parent = (i - 1) shr 1
+    if dist >= h.dists[parent]:
+      break
+    h.dists[i] = h.dists[parent]
+    h.ids[i] = h.ids[parent]
+    i = parent
+  h.dists[i] = dist
+  h.ids[i] = id
+
+proc heapPop(h: var HnswHeap): tuple[dist: float32, id: int] {.inline.} =
+  ## Remove and return the smallest key. `h.n` has to be > 0 - the walk checks
+  ## it, because a heap it can empty is how a layer ends.
+  result = (h.dists[0], h.ids[0])
+  dec h.n
+  if h.n > 0:
+    # The last entry takes the root's place and sifts back down into the hole.
+    let dist = h.dists[h.n]
+    let id = h.ids[h.n]
+    var i = 0
+    while true:
+      var child = 2 * i + 1
+      if child >= h.n:
+        break
+      if child + 1 < h.n and h.dists[child + 1] < h.dists[child]:
+        inc child                  # the smaller of the two children
+      if h.dists[child] >= dist:
+        break
+      h.dists[i] = h.dists[child]
+      h.ids[i] = h.ids[child]
+      i = child
+    h.dists[i] = dist
+    h.ids[i] = id
+
+proc worst(h: HnswHeap): float32 {.inline.} =
+  ## The distance the `results` heap would evict next: the farthest the walk is
+  ## still keeping. That heap is the min-heap keyed on `-dist`, so its top is the
+  ## largest distance, and this negation is the only place the convention shows.
+  ## `h.n` must be > 0, which every caller's `ef` guarantees.
+  -h.dists[0]
+
 proc cmpNeighbor(a, b: Neighbor): int = cmp(a.dist, b.dist)
 
 proc sim*(hit: Hit): float32 =
@@ -1668,21 +1733,21 @@ proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
 
   var over: seq[int]
   var spare: seq[int]
-  var candidates = initHeapQueue[AscItem]()
-  var results = initHeapQueue[DescItem]()
+  var candidates = HnswHeap()
+  var results = HnswHeap()
   var d: float32
   for ep in entryPoints:
     if ep < 0 or ep >= ix.count or ix.seenOrMark(over, ep, epoch):
       continue
     if not ix.distanceAt(qv, ep, d):
       continue                        # deleted id (e.g. a stale entry point)
-    candidates.push(AscItem(dist: d, id: ep))
-    results.push(DescItem(dist: d, id: ep))
+    candidates.heapPush(d, ep)
+    results.heapPush(-d, ep)
 
-  while candidates.len > 0:
-    let c = candidates.pop()
+  while candidates.n > 0:
+    let c = candidates.heapPop()
     # Everything left is farther than the worst result we keep -> done.
-    if results.len >= ef and c.dist > results[0].dist:
+    if results.n >= ef and c.dist > results.worst:
       break
     let (lp, ln) = ix.linksAt(c.id, level, spare)
     for k in 0 ..< ln:
@@ -1693,15 +1758,15 @@ proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
         # Freed id, reached through a link that neighbour pruning left one-way.
         # Treating it as "skip" keeps deleted nodes out of the result set.
         continue
-      if results.len < ef or d < results[0].dist:
-        candidates.push(AscItem(dist: d, id: e))
-        results.push(DescItem(dist: d, id: e))
-        if results.len > ef:
-          discard results.pop()   # max-heap: drops the farthest
+      if results.n < ef or d < results.worst:
+        candidates.heapPush(d, e)
+        results.heapPush(-d, e)
+        if results.n > ef:
+          discard results.heapPop()   # min-heap on -dist: drops the farthest
   # Pop the max-heap to get descending order, then reverse to ascending.
-  while results.len > 0:
-    let r = results.pop()
-    result.add (dist: r.dist, id: r.id)
+  while results.n > 0:
+    let r = results.heapPop()
+    result.add (dist: -r.dist, id: r.id)
   result.reverse()
 
 proc selectNeighbors(ix: HnswIndex, candidates: seq[Neighbor], m: int,
