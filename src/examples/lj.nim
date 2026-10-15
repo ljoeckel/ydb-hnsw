@@ -9,28 +9,20 @@ const
 
 when isMainModule:
     var cnt, notSelfCount, hitsCount = 0
-    let params = hnswParams("^HNSWArticles", cacheVectors=true)
+    let params = hnswParams("^HNSWArticles", model = "none", cacheVectors=true)
     let ix = openHnsw(params)
-    echo $ix.params
-    echo ix.levelsSummary()
     
     let t1 = getTime() # set start for caclulation
     var t0 = gettime() # for each 100 segment
+    
     for (subs, vs) in QueryItr ^HNSWArticlesNODE.sv: 
         let id = Get ^HNSWArticlesKEY(subs[0])
-
         # The stored value is the query: `searchBlob` decodes it exactly the way
         # `loadVec` decodes a neighbour and walks - no float32, no normalise, no quantize.
         let hits = ix.searchBlob(vs)
-
-        if hits.len == 0:
-            echo "    Self not found: ", id
-            inc notSelfCount
-        else:
-            discard
-        #    for hit in hits:
-        #        if hit.sim() > MinSim:
-        #             echo &"    {hit.sim()} {hit.id} {getRssTitle(hit.id)}"
+        #for hit in hits:
+        #    if hit.sim() > MinSim:
+        #         echo &"    {hit.sim()} {hit.id} {getRssTitle(hit.id)}"
 
         inc cnt
         inc(hitsCount, hits.len)

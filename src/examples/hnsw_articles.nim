@@ -181,47 +181,18 @@ when isMainModule:
     var cnt = 0
     var added = 0
 
-    for (cnt, idxref, title, vec) in enumerate(batchedRSSNewTitleIter(ix)):
-        #echo cnt, " ", idxref, " ", title, " ", vec.len
-        if cnt >= opts.limit:
-            break
+    for (cnt, idxref, title, vec, vec2) in enumerate(batchedRSSNewTitleIter(ix)):
+        if cnt >= opts.limit: break
+        echo cnt, " ", idxref, " ", title, " vec.len=", vec.len, " vec2.len=", vec2.len
 
-        #let rc = Transaction:
-        #    discard ix.add(embedNormalized(title), idxref)
-        #if rc != YDB_OK:
-        #    quit &"Transaction for {idxref} on {opts.index} returned {rc} - the article was not indexed", 1
-        #discard ix.add(embedNormalized(title), idxref)
-        
-        let rc = Transaction:
-            discard ix.add(vec, idxref)
-        if rc != YDB_OK:
-            quit &"Transaction for {idxref} on {opts.index} returned {rc} - the article was not indexed", 1
+        # add the Title
+        discard ix.add(vec, idxref)
+        # add the Description
+        discard ix.add(vec2, idxref)
 
         inc added
         if added mod 100 == 0:
             echo &"  {added} added, {cnt} seen, {ix.liveCount} nodes, {epochTime() - started:.0f} s"
-
-
-    # for (idxref, title) in RSSTitleIter():
-    #     if cnt >= opts.limit:
-    #         break
-    #     inc cnt
-    #     # One Data call on this index's key global: an article that is already
-    #     # keyed is never re-embedded.
-    #     if not ix.contains(idxref):
-    #         # `Transaction` returns YottaDB's status: YDB_OK means the add
-    #         # committed, YDB_TP_ROLLBACK means it was retried MAX_RESTARTS times
-    #         # and then thrown away. Ignoring that would silently drop the
-    #         # article (and its vector) from the index, so fail loudly instead.
-    #         let rc = Transaction:
-    #             discard ix.add(embedNormalized(title), idxref)
-    #         if rc != YDB_OK:
-    #             quit &"Transaction for {idxref} on {opts.index} returned {rc} - " &
-    #                  &"the article was not indexed", 1
-    #         inc added
-    #         if added mod 100 == 0:
-    #             echo &"  {added} added, {cnt} seen, {ix.liveCount} nodes, {epochTime() - started:.0f} s"
-    #             #updateDBStats("hnsw_articles")
 
     echo &"done: {added} added, {cnt} seen, live={ix.liveCount} count={ix.count} in {epochTime() - started:.0f} s"
     if ix.dim > 0:

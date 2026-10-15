@@ -1730,11 +1730,12 @@ proc openHnsw*(p: HnswParams): HnswIndex =
   # The load happens here, at the end, so a config error above fails before the
   # weights are pulled in. Without a loader (see `setModelLoader`) the name is
   # carried along but nothing is loaded - the tests never import Python.
-  result.params.model = result.metaGetName("model", p.model)
-  if result.params.model.len > 0 and not modelLoader.isNil:
-    # The loader reports back the name it resolved to (a short id, a local path,
-    # the default) - that resolved name is what the index is described by.
-    result.params.model = modelLoader(result.params.model)
+  if result.params.model.cmpIgnoreCase("NONE") != 0:
+      result.params.model = result.metaGetName("model", p.model)
+      if result.params.model.len > 0 and not modelLoader.isNil:
+        # The loader reports back the name it resolved to (a short id, a local path,
+        # the default) - that resolved name is what the index is described by.
+        result.params.model = modelLoader(result.params.model)
 
   # The vector cache is not part of an index's identity the way M, dim and the
   # storage mode are - it mirrors what is already there and can be thrown away -
