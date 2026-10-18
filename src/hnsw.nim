@@ -107,6 +107,11 @@
 ##     candidate. With `-d:hnswSimd` they use nimsimd intrinsics: measured on the
 ##     384-dim article vectors, 4.1x on the float32 dot (321 -> 78 ns), 6.2x on
 ##     the int8 dot (353 -> 57 ns) and 7.3x on `normalize` (1054 -> 144 ns).
+##     The int8 kernel has a 256-bit body as well (`-d:hnswAvx2`), which is
+##     opt-in: on a Ryzen 2700X it measured 36.3 ns/dot against the 128-bit
+##     body's 28.5, because Zen 1/+ splits a 256-bit integer operation into two
+##     128-bit halves. Full-width 256-bit cores (Zen 2+, Haswell on) are where
+##     it is worth the flag.
 ##     `--passC:"-march=native"` on its own buys nothing here: these are
 ##     reductions, and gcc will not reassociate them without `-ffast-math`, so
 ##     the vectorization has to be written out.
@@ -135,11 +140,18 @@ import yottadb
 import hnsw_options
 
 when defined(hnswSimd):
-  # 256-bit float / 128-bit integer distance kernels. The C compiler has to
-  # target a CPU with AVX (this project passes `-mavx`), which is why it is a
-  # define and not the default: without it the scalar loops are used, and those
-  # build anywhere. Enable with `-d:hnswSimd`.
+  # 256-bit float / integer distance kernels. The C compiler has to target a
+  # CPU with AVX (this project passes `-mavx`), which is why it is a define and
+  # not the default: without it the scalar loops are used, and those build
+  # anywhere. Enable with `-d:hnswSimd`.
+  #
+  # `-d:hnswAvx2` swaps the int8 kernel's 128-bit body for a 256-bit one. That
+  # one also needs AVX2 in the compiler's target, which `config.nims` adds with
+  # the define. It is opt-in and not the default because it is not universally
+  # faster: see `dotI8Avx2` for the measurement on Zen 1/+.
   import nimsimd/avx
+  when defined(hnswAvx2):
+    import nimsimd/avx2
 
 when defined(gcc) or defined(clang):
   proc hnswPrefetch(p: pointer) {.inline.} =
@@ -623,12 +635,11 @@ when defined(hnswSimd):
       result += pa[i] * pb[i]
       inc i
 
-  func simdDotI8(pa, pb: ptr UncheckedArray[int8], n: int): int32 =
-    ## int8 dot product in 128-bit integer SIMD. This machine has AVX but not
-    ## AVX2, so there is no 256-bit integer path to take - but 128 bits still
-    ## beats scalar by a wide margin: `pmovsxbw` widens 8 bytes to int16 and
-    ## `pmaddwd` folds 8 products into 4 int32, so 16 components go through per
-    ## iteration. The accumulators stay exact int32.
+  func dotI8Sse(pa, pb: ptr UncheckedArray[int8], n: int): int32 =
+    ## int8 dot product in 128-bit integer SIMD - the body every x86-64 build
+    ## can run. `pmovsxbw` widens 8 bytes to int16 and `pmaddwd` folds 8 products
+    ## into 4 int32, so 16 components go through per iteration, in two
+    ## half-register pairs. The accumulators stay exact int32.
     var i = 0
     var acc0 = mm_setzero_si128()
     var acc1 = mm_setzero_si128()
@@ -650,6 +661,68 @@ when defined(hnswSimd):
     while i < n:
       result += int32(pa[i]) * int32(pb[i])
       inc i
+
+  when defined(hnswAvx2):
+    func dotI8Avx2(pa, pb: ptr UncheckedArray[int8], n: int): int32 =
+      ## int8 dot product in 256-bit integer SIMD: `vpmovsxbw` widens 16 bytes
+      ## straight into a `__m256i` of int16 and `vpmaddwd` folds them into 8
+      ## int32, so one pair does the work of `dotI8Sse`'s two.
+      ##
+      ## Four accumulators over 64 components per iteration, so the loop has
+      ## several independent `vpmaddwd`/`vpaddd` chains in flight. That turned
+      ## out not to be the limit: on a Ryzen 2700X this measures 36.3 ns/dot for
+      ## the 384-dim vectors against the 128-bit body's 28.5, with two chains
+      ## and with four, which is the signature of a throughput bound - Zen 1/+
+      ## splits every 256-bit integer operation into two 128-bit halves, so the
+      ## wider form buys nothing there. On Zen 2+ and on Intel from Haswell on
+      ## the 256-bit units are full width, which is where it pays.
+      ##
+      ## Still exact: the widest partial sum is 127 * 127 * 384, far below 2^31.
+      var i = 0
+      var acc0 = mm256_setzero_si256()
+      var acc1 = mm256_setzero_si256()
+      var acc2 = mm256_setzero_si256()
+      var acc3 = mm256_setzero_si256()
+      while i + 64 <= n:
+        acc0 = mm256_add_epi32(acc0,
+          mm256_madd_epi16(mm256_cvtepi8_epi16(mm_loadu_si128(pa[i].unsafeAddr)),
+                           mm256_cvtepi8_epi16(mm_loadu_si128(pb[i].unsafeAddr))))
+        acc1 = mm256_add_epi32(acc1,
+          mm256_madd_epi16(mm256_cvtepi8_epi16(mm_loadu_si128(pa[i + 16].unsafeAddr)),
+                           mm256_cvtepi8_epi16(mm_loadu_si128(pb[i + 16].unsafeAddr))))
+        acc2 = mm256_add_epi32(acc2,
+          mm256_madd_epi16(mm256_cvtepi8_epi16(mm_loadu_si128(pa[i + 32].unsafeAddr)),
+                           mm256_cvtepi8_epi16(mm_loadu_si128(pb[i + 32].unsafeAddr))))
+        acc3 = mm256_add_epi32(acc3,
+          mm256_madd_epi16(mm256_cvtepi8_epi16(mm_loadu_si128(pa[i + 48].unsafeAddr)),
+                           mm256_cvtepi8_epi16(mm_loadu_si128(pb[i + 48].unsafeAddr))))
+        i += 64
+      while i + 16 <= n:
+        acc0 = mm256_add_epi32(acc0,
+          mm256_madd_epi16(mm256_cvtepi8_epi16(mm_loadu_si128(pa[i].unsafeAddr)),
+                           mm256_cvtepi8_epi16(mm_loadu_si128(pb[i].unsafeAddr))))
+        i += 16
+      # 256 -> 128 -> the four int32 lanes, which are summed in the scalar unit:
+      # one store is cheaper here than two `phaddd` pairs.
+      let acc = mm256_add_epi32(mm256_add_epi32(acc0, acc1),
+                                mm256_add_epi32(acc2, acc3))
+      let s = mm_add_epi32(mm256_castsi256_si128(acc),
+                           mm256_extracti128_si256(acc, 1))
+      var t: array[4, int32]
+      mm_storeu_si128(t[0].addr, s)
+      result = t[0] + t[1] + t[2] + t[3]
+      while i < n:
+        result += int32(pa[i]) * int32(pb[i])
+        inc i
+
+  func simdDotI8(pa, pb: ptr UncheckedArray[int8], n: int): int32 =
+    ## The int8 dot product the index actually calls. Both bodies return the
+    ## same int32 - integer addition is associative and exact, so the kernel
+    ## change moves no distance and no result, only the instruction count.
+    when defined(hnswAvx2):
+      dotI8Avx2(pa, pb, n)
+    else:
+      dotI8Sse(pa, pb, n)
 
 func normalize*(v: var seq[float32]) =
   when defined(hnswSimd):

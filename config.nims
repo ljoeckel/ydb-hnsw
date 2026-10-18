@@ -11,6 +11,14 @@ when withDir(thisDir(), system.fileExists("nimble.paths")):
 if not defined(hnswNoSimd):
   switch("define", "hnswSimd")
   switch("passC", "-mavx")
+  # The int8 kernel has a 256-bit body too, but it is opt-in: on Zen 1/+ a
+  # 256-bit integer operation is split into two 128-bit halves, and there the
+  # AVX2 loop measured 36.3 ns/dot against the 128-bit body's 28.5 on the
+  # 384-dim vectors - 28% slower, not faster. Haswell through Skylake and
+  # Zen 2+ run 256-bit at full width, so `-d:hnswAvx2` is worth trying there;
+  # it brings `-mavx2` with it rather than leaving the flag to the caller.
+  if defined(hnswAvx2):
+    switch("passC", "-mavx2")
 
 # --- YottaDB linking ---------------------------------------------------------
 # nimyottadb declares the YottaDB C API with plain `importc` pragmas (no
