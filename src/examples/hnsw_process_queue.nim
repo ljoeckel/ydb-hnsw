@@ -9,19 +9,6 @@ const
 
 
 proc claimNext(): string =
-    ## Claim the first item nobody holds yet and return its idxref ("" when there
-    ## is nothing to do).
-    ##
-    ## The claim is a `$INCREMENT` on the item's "work" node: it is atomic across
-    ## processes, so when two processors race for the same item exactly one sees
-    ## the marker go 0 -> 1 and wins, while the other sees 2 and moves on. No
-    ## lock is involved on purpose - the DSL caps a lock timeout at ~2.1 s and the
-    ## scan can have to walk a long run of already-claimed items, so a lock here
-    ## just moves the failure from "empty workItem" to YDB_LOCK_TIMEOUT.
-    ##
-    ## "vec" is the last field the producer writes, so testing for it means we
-    ## only ever claim a fully written item; a half-written one is simply skipped
-    ## this pass and picked up on a later one.
     var idxref = Order @gblQueue("")
     while idxref.len > 0:
         if 0 != Data @gblQueue(idxref, "vec"):
@@ -31,30 +18,27 @@ proc claimNext(): string =
 
 
 proc processor() =
-    let params = hnswParams(gbl, cacheVectors=true)
+    let params = getHnswParams()
     let ix = openHnsw(params)
     echo $ix.params
+    
     var cnt = 0
     var avgDurationInMs = 0
     var t1 = now()
+
+    let started = epochTime()
+
+    proc logInfo(cnt: int) =
+        let ips = cnt.float / (epochTime() - started)
+        echo &"Processed: {cnt} with {ips:5.2f} nodes/s"
 
     while true:
         let idxref = claimNext()
         if idxref.len == 0:
             echo "Wait for work"
-            sleep(1000)
+            sleep(250)
             continue
 
-        # let vec = ydb_get(ix.params.globalQueue, @[idxref])
-        # if vec.len == 0:
-        #     echo "WARN: giving back empty idxref:", idxref
-        #     Killnode @gblQueue(idxref, "work")
-        # else:
-        #     discard ix.add(unpackFloats(vec), idxref)
-        #     Kill @gblQueue(idxref)      # done - drop the whole item
-        #     inc cnt
-        #     if cnt mod 100 == 0: echo cnt
-            
         let workItem = loadObject[WorkItem](idxref, globalName=gblQueue)
         if workItem.idxref == "":
             # Rare: the item was deleted between the scan and our claim, so the
@@ -68,6 +52,7 @@ proc processor() =
             Kill @gblQueue(idxref)      # done - drop the whole item
             inc cnt
             if cnt mod 100 == 0:
+                logInfo(cnt)
                 let t2 = (now() - t1).inMilliseconds
                 avgDurationInMs += t2
                 t1 = now()
@@ -82,21 +67,5 @@ proc starter(count: int) =
         discard job("./hnsw_process_queue", @["--processor"])
     
 
-proc check() =
-    for cnt in QueryItr @gblQueue.count:
-        echo fmt"{gblQueue} cnt={cnt}"
-
-
-
 if isMainModule:
-    for param in commandLineParams():
-        if param == "--check":
-            check()
-        elif param == "--processor":
-            processor()
-        else:
-            echo "Valid commands are:"
-            echo "  --processor           Run one processor in foreground"
-            echo "  --theads=n            Start n threads"
-            echo "  --check               Check current status"
-            quit(0)
+    processor()

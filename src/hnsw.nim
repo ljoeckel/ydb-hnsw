@@ -132,6 +132,7 @@
 
 import std/[algorithm, math, random, sets, times, strutils, unicode]
 import yottadb
+import hnsw_options
 
 when defined(hnswSimd):
   # 256-bit float / 128-bit integer distance kernels. The C compiler has to
@@ -146,50 +147,12 @@ const DefaultModel* = "paraphrase-multilingual-MiniLM-L12-v2" # 384 dims
   ## or the "model" key of an index that already exists - names another one.
 
 type
-  VecQuant* = enum
-    ## How an index stores (and compares) its vectors.
-    vqNone      ## float32, 4 bytes per dimension - default, lossless
-    vqInt8      ## scalar-quantized, grid stored with each vector (4 + dim bytes)
-    vqInt8Fixed ## scalar-quantized on one grid for the whole index (dim bytes)
-
-  LinkFmt* = enum
-    ## How an index stores a neighbour id in `^...LINKS`, see `HnswParams.linkFmt`.
-    ##
-    ## Both are decoded back into `int`; the choice only decides how many bytes a
-    ## link costs in YottaDB.
-    lfInt     ## int64, 8 bytes per id - default, and what older indexes hold
-    lfUint32  ## uint32, 4 bytes per id - halves the link tree, ids < 2^32
-
   ModelLoader* = proc(model: string): string
     ## How `openHnsw` reaches the embedding model named in `HnswParams.model`:
     ## load `model` and return the name it ends up loaded under. The host program
     ## installs it with `setModelLoader` - `bert_nim.nim` does that at import
     ## time - which is what keeps this module free of Python. A program that
     ## never embeds (the pure-Nim tests) leaves it nil.
-
-  HnswParams* = object
-    model*: string = DefaultModel   ## The hugging face model name
-    global*: string                 ## YottaDB global basename ^HNSWxxx
-    globalNode*: string             ## YottaDB global ^HNSWxxxNODE
-    globalLinks*: string            ## YottaDB global ^HNSWxxxLINKS
-    globalLevel*: string            ## YottaDB global ^HNSWxxxLEVEL
-    globalKey*: string              ## YottaDB global ^HNSWxxxKEY
-    globalMeta*: string             ## YottaDB global ^HNSWxxxMETA
-    globalQueue*: string             ## YottaDB global ^HNSWxxxQUEUE
-    M*: int = 16                    ## links per node above layer 0
-    efConstruction*: int = 200      ## candidate width while inserting
-    efSearch*: int = 64             ## default candidate width while searching
-    seed*: int = 1234               ## RNG seed for the random level draw
-    dim*: int = 0                   ## Dimension
-    quant*: VecQuant = vqNone       ## vector storage / quantization mode
-    quantScale*: float32 = 0.0'f32  ## the int8 grid for vqInt8Fixed, ignored otherwise
-    linkFmt*: LinkFmt = lfUInt32    ## neighbour id width stored in LINKS, see `LinkFmt`
-    cacheVectors*: bool = true      ## read every vector into memory on open, see
-                                    ## `preloadVectors`
-    cacheLinks*: bool = true        ## keep every neighbour list this process
-                                    ## touches in memory, see `linksAt`; the link
-                                    ## half of `cacheVectors`
-    batchSize*: int = 128           ## Default batch size for g.e. batchedIterator, etc.
 
   Neighbor* = tuple[dist: float32, id: int]
 
@@ -1040,13 +1003,6 @@ proc lookup*(ix: HnswIndex, key: string): int =
   let s = ydb_get(ix.params.globalKey, @[key])
   if s.len == 0: -1 else: parseInt(s)
 
-proc contains*(ix: HnswIndex, key: string): bool =
-  ## Whether `key` is already indexed in *this* index. One YottaDB `Data` call
-  ## instead of a value read, so it is the cheap way to skip work for an article
-  ## that is already in the graph - and it asks the index that is being built,
-  ## not a hard-coded global.
-  ydb_data(ix.params.globalKey, @[key]) != 0
-
 # ---------------------------------------------------------------------------
 # in-process link mirror
 # ---------------------------------------------------------------------------
@@ -1439,6 +1395,23 @@ proc cacheVector(ix: HnswIndex, id: int): bool =
   ix.absentIds.excl(id)
   true
 
+proc preloadLinks(ix: HnswIndex): int =
+    if ix.dim <= 0 or ix.count == 0:
+      return 0
+
+    echo "Preloading up to ", ix.live, " links of ", ix.count, " id(s)"
+    let t1 = now()
+
+    let gbl = ix.params.globalLinks
+    for keys in QueryItr @gbl.keys:
+        let id = parseInt(keys[0])
+        let level = parseInt(keys[1])
+        let links = unpackLinks(ix.params.linkFmt, ydb_get(ix.params.globalLinks, @[$id, $level]))
+        ix.linksStore(id, level, links)
+        inc result
+
+    echo "'Links' cache loaded with ", result, " entries in ", $(now() - t1).inMilliseconds, " ms."
+    return result
 
 proc preloadVectors*(ix: HnswIndex): int =
   ## Read every vector into process memory, returning how many were loaded.
@@ -1480,7 +1453,7 @@ proc preloadVectors*(ix: HnswIndex): int =
   if ix.live != result:
     ix.live = result
     ix.metaSet("live", $result)
-  echo "Cache loaded with ", result, " entries in ", $(now() - t1).inMilliseconds, " ms."
+  echo "'Vector' cache loaded with ", result, " entries in ", $(now() - t1).inMilliseconds, " ms."
 
 proc cachedVectors*(ix: HnswIndex): int =
   ## How many vectors the in-process cache holds (0 when there is none). O(1) now
@@ -1620,8 +1593,7 @@ proc inferDim(ix: HnswIndex): int =
       best = c
       want = n
   if best * 4 < lens.len * 3:
-    echo "NODE blobs have mixed widths (", lens.len, " read, ", best,
-         " agree); leaving META without a dimension"
+    echo "NODE blobs have mixed widths (", lens.len, " read, ", best, " agree); leaving META without a dimension"
     return 0
   case ix.params.quant
   of vqNone:
@@ -1656,6 +1628,7 @@ proc openHnsw*(p: HnswParams): HnswIndex =
   ## through `setModelLoader`; with no loader installed the name is only carried.
   new(result)
   result.params = p
+  
   # Fill in `^...NODE` / `^...KEY` / `^...META` from `p.global` if the caller wrote
   # the params out as an `HnswParams` rather than going through `hnswParams` -
   # otherwise an empty name reaches the C API, and YottaDB answers that either
@@ -1737,12 +1710,18 @@ proc openHnsw*(p: HnswParams): HnswIndex =
         # the default) - that resolved name is what the index is described by.
         result.params.model = modelLoader(result.params.model)
 
+  if result.params.verbose:
+    echo result.params
+    
   # The vector cache is not part of an index's identity the way M, dim and the
   # storage mode are - it mirrors what is already there and can be thrown away -
   # so it is the one thing that comes from `p` and not from META. Reading the
   # vectors back is O(count) round trips, hence the explicit opt-in.
-  if result.params.cacheVectors:
+  if result.params.cacheVectors and result.params.preloadCacheVectors:
     discard result.preloadVectors()
+  if result.params.cacheLinks and result.params.preloadCacheLinks:
+    discard result.preloadLinks()
+  
 
   let gbl = result.params.globalMeta
   let p = result.params
@@ -1986,7 +1965,7 @@ proc add*(ix: HnswIndex, vec: openArray[float32], key = ""): int =
   ##
   doAssert key.len > 0, "add: empty key"
 
-  ## Passing `key` records the key -> node id mapping used by `lookup`/`contains`.
+  ## Passing `key` records the key -> node id mapping used by `lookup`.
   ## `vec` is copied before it is normalised, so the caller's seq is untouched.
   ##
   ## The id comes from an atomic `$INCREMENT` on META("count"), never from our own
@@ -2459,3 +2438,13 @@ proc levelsSummary*(ix: HnswIndex): string =
       result.add "  "
     result.add "L" & $l & ": " & $n
   result.add " node(s), entry=" & $ix.entry & " maxLevel=" & $ix.maxLevel
+
+
+# ---------------------------------------------------------------------------
+# Maintenence
+# ---------------------------------------------------------------------------
+
+proc dropIndex*(params: HnswParams) =
+    for gbl in [params.globalNode, params.globalKey, params.globalMeta, params.globalLevel, params.globalKey, params.globalLinks, params.globalQueue]:
+        ydb_delete(gbl, @[], YDB_DEL_TREE)
+        echo gbl, " deleted"
