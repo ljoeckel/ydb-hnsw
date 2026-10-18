@@ -141,6 +141,16 @@ when defined(hnswSimd):
   # build anywhere. Enable with `-d:hnswSimd`.
   import nimsimd/avx
 
+when defined(gcc) or defined(clang):
+  proc hnswPrefetch(p: pointer) {.inline.} =
+    ## Ask the CPU to pull `p` into cache for a read that is about to happen.
+    ## Emitted as GCC/Clang's builtin, which is available on every target they
+    ## support and costs one instruction; other compilers make it disappear.
+    {.emit: "__builtin_prefetch(`p`, 0, 3);".}
+else:
+  template hnswPrefetch(p: pointer) =
+    discard
+
 const DefaultModel* = "paraphrase-multilingual-MiniLM-L12-v2" # 384 dims
 #const DefaultModel* = "intfloat/multilingual-e5-base"  # 768 dims
   ## The sentence-transformers model an index uses unless `HnswParams.model` -
@@ -1007,10 +1017,10 @@ proc distanceAt(ix: HnswIndex, q: VecView, id: int, dist: var float32): bool {.i
   ## did with `loadVec`'s `.isMissing`.
   ##
   ## This is the walk's per-candidate path, so the storage mode is not re-decided
-  ## here. `q`'s form *is* the index's mode - `searchStored` builds it through
-  ## `toStored` / `blobVector`, and `searchInt8` refuses an index that disagrees -
-  ## and the arena a slot points into holds that same form. Reading it straight
-  ## through the one branch below is what keeps the `case` on `quant`, and the
+  ## here. `q`'s form *is* the index's mode - `searchView` gets it from
+  ## `toStored`, `searchInt8` pins the scale, and `searchBlob` refuses an index
+  ## that disagrees - and the arena a slot points into holds that same form.
+  ## Reading it straight through the one branch below is what keeps the `case` on `quant`, and the
   ## `VecView` `cacheViewAt` used to build and throw away, out of the loop;
   ## `dotView` keeps its full checks for the callers that hand it two arbitrary
   ## vectors.
@@ -1039,6 +1049,36 @@ proc distanceAt(ix: HnswIndex, q: VecView, id: int, dist: var float32): bool {.i
     return false
   dist = distanceView(q, viewOf(ev))
   true
+
+when (defined(gcc) or defined(clang)) and not defined(hnswNoPrefetch):
+  const
+    PrefetchEnabled = true
+      ## Software prefetch of the next candidate's vector.
+      ##
+      ## Measured on the 318,720-node `vqInt8` article index (124 MB arena, so
+      ## the vectors come from DRAM): ef=64 245.3 -> 201.7 us/query (1.22x),
+      ## ef=256 787 -> 664 us (1.18x). Pinned to one core, link mirror
+      ## preloaded. `-d:hnswNoPrefetch` turns it off.
+    PrefetchAhead {.intdefine.} = 1
+      ## Link entries between the prefetch and the access. 1 and 2 measured the
+      ## same on the article index, 3 and 4 were worse (the prefetch then lands
+      ## so early that the line is evicted or the extra work stalls the loop).
+      ## `-d:PrefetchAhead=N` to tune.
+else:
+  const PrefetchEnabled = false
+
+when PrefetchEnabled:
+  proc prefetchVec(ix: HnswIndex, id: int) {.inline.} =
+    ## Hint that `id`'s vector is about to be read. A hint only: an id the cache
+    ## does not hold - or a deleted one - costs the slot lookup and nothing else,
+    ## and a prefetch never faults.
+    let slot = ix.cacheSlot(id)
+    if slot >= 0 and ix.cache.dim > 0:
+      let base = slot * ix.cache.dim
+      if ix.params.quant == vqNone:
+        hnswPrefetch(cast[pointer](ix.cache.floats[base].addr))
+      else:
+        hnswPrefetch(cast[pointer](ix.cache.codes[base].addr))
 
 
 # ---------------------------------------------------------------------------
@@ -1608,7 +1648,7 @@ proc inferDim(ix: HnswIndex): int =
   ## vectors and still not know how wide they are, which is not a state anything
   ## downstream can use: `bytesPerVector` comes out 0 or 4, `preloadVectors`
   ## returns immediately (so `cacheVectors` silently does nothing) and
-  ## `blobVector` rejects the very blobs the index wrote.
+  ## `blobView` rejects the very blobs the index wrote.
   ##
   ## The blobs themselves say it. `bytesPerVector` is a function of the mode and
   ## the dimension and nothing else, so it inverts exactly - there is nothing to
@@ -1873,7 +1913,7 @@ func seenOrMark(ix: HnswIndex, over: var seq[int], e: int, epoch: int32): bool {
   over.add e
   false
 
-proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
+proc searchLayer(ix: HnswIndex, q: VecView, entryPoints: openArray[int],
                  ef: int, level: int): NeighborView =
   ## Greedy best-first search on one layer, against the *stored* vectors (codes
   ## for a quantized index). Returns the `ef` closest nodes found, nearest first,
@@ -1882,14 +1922,14 @@ proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
   ## Candidates and their neighbour lists are both read through the in-process
   ## mirrors (`distanceAt`, `linksAt`), so a vector or a link list they hold is
   ## used where it already sits - no per-candidate allocation, no copy, no YottaDB
-  ## read. The query is borrowed into a view once, before the loop, because it is
-  ## the same vector for every comparison this call makes.
+  ## read. The query is borrowed, so a caller that already holds the bytes - a
+  ## `StoredVec`, or the `^...NODE` blob itself - passes a view instead of a copy.
   ##
-  ## The heaps, the two small buffers and the result buffer are the index's
-  ## scratch (`SearchScratch`), reset here instead of allocated: a query runs this
-  ## once per layer and a build once per layer per insert, and the four seqs plus
-  ## their growth were pure churn. Resetting is `n = 0` because `n` is the only
-  ## thing a heap reads, and everything below it is written before it is read.
+  ## The heaps, the small buffers and the result buffer are the index's scratch
+  ## (`SearchScratch`), reset here instead of allocated: a query runs this once
+  ## per layer and a build once per layer per insert, and the four seqs plus their
+  ## growth were pure churn. Resetting is `n = 0` because `n` is the only thing a
+  ## heap reads, and everything below it is written before it is read.
   if ix.visitedStamp.len < ix.count:
     ix.visitedStamp.setLen(ix.count)   # new slots read 0, every epoch is >= 1
   inc ix.visitEpoch
@@ -1897,10 +1937,6 @@ proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
     for i in 0 ..< ix.visitedStamp.len: ix.visitedStamp[i] = 0
     ix.visitEpoch = 1
   let epoch = ix.visitEpoch
-
-  # The query is the same vector for every comparison in this call, so its view
-  # is taken once, here, rather than per candidate.
-  let qv = viewOf(q)
 
   ix.scratch.candidates.n = 0
   ix.scratch.results.n = 0
@@ -1910,7 +1946,7 @@ proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
   for ep in entryPoints:
     if ep < 0 or ep >= ix.count or ix.seenOrMark(ix.scratch.over, ep, epoch):
       continue
-    if not ix.distanceAt(qv, ep, d):
+    if not ix.distanceAt(q, ep, d):
       continue                        # deleted id (e.g. a stale entry point)
     ix.scratch.candidates.heapPush(d, ep)
     ix.scratch.results.heapPush(-d, ep)
@@ -1922,10 +1958,16 @@ proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
       break
     let (lp, ln) = ix.linksAt(c.id, level, ix.scratch.spare)
     for k in 0 ..< ln:
+      when PrefetchEnabled:
+        # Hint the vector of an entry a little further down the list: the dot
+        # for entry k takes long enough that entry k+1 is often too late to
+        # cover a DRAM miss, and the list is known up front so this is free.
+        if k + PrefetchAhead < ln:
+          ix.prefetchVec(lp[k + PrefetchAhead])
       let e = lp[k]
       if ix.seenOrMark(ix.scratch.over, e, epoch):
         continue
-      if not ix.distanceAt(qv, e, d):
+      if not ix.distanceAt(q, e, d):
         # Freed id, reached through a link that neighbour pruning left one-way.
         # Treating it as "skip" keeps deleted nodes out of the result set.
         continue
@@ -2027,7 +2069,7 @@ proc connect(ix: HnswIndex, id: int, vec: StoredVec, level: int, ep: var int) =
   ## Shared by `add` and by the repair step, so a re-linked node ends up
   ## connected by exactly the same rules as a freshly inserted one.
   var w: seq[Neighbor]
-  for cand in ix.searchLayer(vec, [ep], ix.params.efConstruction, level):
+  for cand in ix.searchLayer(viewOf(vec), [ep], ix.params.efConstruction, level):
     # A node must never link to itself. During `add` this cannot happen (the new
     # node is in nobody's list yet), but a node being re-linked is still in its
     # neighbours' lists, so the search can hand it back as a candidate.
@@ -2151,7 +2193,7 @@ proc add*(ix: HnswIndex, vec: openArray[float32], key = ""): int =
 
   # Phase 1: greedy descent through the layers above ours (ef = 1).
   for l in countdown(ix.maxLevel, level + 1):
-    let w = ix.searchLayer(sv, [ep], 1, l)
+    let w = ix.searchLayer(viewOf(sv), [ep], 1, l)
     if w.len > 0:
       ep = w[0].id
 
@@ -2219,7 +2261,7 @@ proc relink(ix: HnswIndex, id: int, level: int, vec: StoredVec): bool =
 
   # the same greedy descent the insert path uses to reach this layer
   for l in countdown(min(ix.maxLevel, ix.getLevel(ep)), level + 1):
-    let w = ix.searchLayer(vec, [ep], 1, l)
+    let w = ix.searchLayer(viewOf(vec), [ep], 1, l)
     if w.len > 0:
       ep = w[0].id
 
@@ -2389,13 +2431,15 @@ proc repair*(ix: HnswIndex): int =
     ix.metaSet("maxLevel", $ix.maxLevel)
 
 
-proc searchStored(ix: HnswIndex, q: StoredVec, k, ef: int): seq[Hit] =
+proc searchView(ix: HnswIndex, q: VecView, k, ef: int): seq[Hit] =
   ## The walk itself: greedy descent through the layers above 0 with `ef = 1`,
   ## then best-first on layer 0 with `ef`/`k` candidates.
   ##
-  ## Shared by `search` and `searchInt8`, which differ only in how `q` got onto
-  ## the index's grid - keeping one copy is what stops the two entry points from
-  ## drifting apart in what they return.
+  ## Shared by `search`, `searchInt8` and `searchBlob`, which differ only in how
+  ## `q` got onto the index's grid - keeping one copy is what stops the entry
+  ## points from drifting apart in what they return. `q` is borrowed, so a caller
+  ## that already holds the bytes (a `StoredVec`, a quantized query, or the
+  ## `^...NODE` blob itself) passes a view and nothing is copied.
   if ix.entry < 0 or ix.count == 0:
     return @[]
   let width = max(if ef > 0: ef else: ix.params.efSearch, k)
@@ -2408,6 +2452,10 @@ proc searchStored(ix: HnswIndex, q: StoredVec, k, ef: int): seq[Hit] =
   let w = ix.searchLayer(q, [ep], width, 0)
   for i in 0 ..< min(k, w.len):
     result.add Hit(id: w[i].id, dist: w[i].dist)
+
+proc searchStored(ix: HnswIndex, q: StoredVec, k, ef: int): seq[Hit] =
+  ## `searchView` for a query the index already holds as a `StoredVec`.
+  ix.searchView(viewOf(q), k, ef)
 
 proc search*(ix: HnswIndex, vec: openArray[float32], k = 5, ef = 0): seq[Hit] =
   ## The `k` closest nodes to `vec`, nearest first.
@@ -2468,23 +2516,37 @@ proc searchInt8*(ix: HnswIndex, codes: openArray[int8], k = 5, ef = 0,
     raise newException(ValueError,
       "searchInt8 scale is the query's quantization scale, so > 0 (or 0 to " &
       "take the index's own)")
-  let q = StoredVec(codes: @codes,
-                    scale: if scale > 0: scale
-                           elif ix.params.quant == vqInt8Fixed: ix.params.quantScale
-                           else: 1.0'f32)
-  ix.searchStored(q, k, ef)
+  # Borrow the caller's codes instead of copying them into a fresh seq: they are
+  # alive for the call, and `searchView` finishes before it returns. An empty
+  # input stays an empty view, exactly as the copied seq used to.
+  var q = VecView(scale: if scale > 0: scale
+                         elif ix.params.quant == vqInt8Fixed: ix.params.quantScale
+                         else: 1.0'f32,
+                  dim: codes.len)
+  if codes.len > 0:
+    q.codes = cast[ptr UncheckedArray[int8]](codes[0].unsafeAddr)
+  ix.searchView(q, k, ef)
 
 
-proc blobVector(ix: HnswIndex, blob: string): StoredVec =
-  ## Decode a stored vector blob - a `^...NODE` value as it comes out of YottaDB -
-  ## the way `ix.params.quant` says it was written. Exactly the decode `loadVec`
-  ## does for a neighbour: the two must not drift, or a query would be compared
-  ## on a different grid than the vectors it is compared against.
+proc blobView(ix: HnswIndex, blob: string): VecView =
+  ## Validate a stored vector blob - a `^...NODE` value as it comes out of
+  ## YottaDB - and return a *view* of it, decoded the way `ix.params.quant` says
+  ## it was written. `loadVec` does the same decode for a neighbour, and the two
+  ## must not drift, or a query would be compared on a different grid than the
+  ## vectors it is compared against.
+  ##
+  ## No copy: `searchBlob` hands the blob straight to `searchView`, so the view
+  ## is used while the string is alive. A `vqNone` blob is viewed as `float32`
+  ## even though Nim strings are only byte-aligned - the kernels load unaligned
+  ## (`loadu` under `-d:hnswSimd`, and a plain float load otherwise, which this
+  ## project only ever builds on x86-64).
   ##
   ## The length has to match the mode exactly. That check is the difference
   ## between "your blob is the wrong thing" and a walk over 388 codes that the
-  ## 384-dim kernels are then happy to read past.
-  if blob.len != ix.bytesPerVector:
+  ## 384-dim kernels are then happy to read past. A zero dimension is refused
+  ## outright: it is the one state where the expected length is 0 or 4 and the
+  ## blob cannot be viewed at all.
+  if ix.dim <= 0 or blob.len != ix.bytesPerVector:
     raise newException(ValueError,
       "query blob is " & $blob.len & " bytes, index expects " & $ix.bytesPerVector &
       " for " & $ix.params.quant & " at dim " & $ix.dim &
@@ -2492,14 +2554,18 @@ proc blobVector(ix: HnswIndex, blob: string): StoredVec =
          "; the index records no dimension (" & ix.params.globalMeta &
          "(\"dim\") is missing or 0) and it could not be read off the stored blobs"
        else: ""))
+  result.dim = ix.dim
   case ix.params.quant
   of vqNone:
-    result.floats = unpackFloats(blob)
+    result.floats = cast[ptr UncheckedArray[float32]](blob[0].unsafeAddr)
   of vqInt8:
-    result = unpackQVec(blob)
+    # The scale is the first four bytes, the codes follow. The blob is only
+    # byte-aligned, so the scale is copied rather than loaded through a cast.
+    copyMem(result.scale.addr, blob[0].unsafeAddr, sizeof(float32))
+    result.codes = cast[ptr UncheckedArray[int8]](blob[sizeof(float32)].unsafeAddr)
   of vqInt8Fixed:
-    result.codes = unpackInt8(blob)
     result.scale = ix.params.quantScale
+    result.codes = cast[ptr UncheckedArray[int8]](blob[0].unsafeAddr)
 
 
 proc searchBlob*(ix: HnswIndex, blob: string, k = 5, ef = 0): seq[Hit] =
@@ -2518,8 +2584,9 @@ proc searchBlob*(ix: HnswIndex, blob: string, k = 5, ef = 0): seq[Hit] =
   ## distances come out with the same magnitudes `search` reports.
   ##
   ## The blob must be exactly `bytesPerVector` long for the index's mode - see
-  ## `blobVector`, which does the check and the decode.
-  ix.searchStored(ix.blobVector(blob), k, ef)
+  ## `blobView`, which does the check and returns a view into it. Nothing is
+  ## copied on the way in.
+  ix.searchView(ix.blobView(blob), k, ef)
 
 
 # ---------------------------------------------------------------------------
