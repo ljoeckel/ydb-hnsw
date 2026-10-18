@@ -160,6 +160,19 @@ type
     id*: int
     dist*: float32          ## cosine distance (1 - cosine similarity)
 
+  NeighborView = object
+    ## Borrowed neighbour results from one `searchLayer` call: `n` entries at
+    ## `p`, **nearest first**.
+    ##
+    ## The entries live in `SearchScratch.found`, so a view is valid only until the
+    ## next `searchLayer` on the same index. That is the price for removing an
+    ## allocation from every layer of every query and every insert; the rule is
+    ## the same one `VecView` carries, and every current caller already keeps it
+    ## (the descent loops read `[0]` immediately, `connect` copies the entries
+    ## into its own list, and `searchStored` copies its `k` hits out).
+    p: ptr UncheckedArray[Neighbor]
+    n: int
+
   StoredVec = object
     ## A vector the way the index holds it: `codes` + `scale` for the quantized
     ## modes, `floats` for vqNone. Both fields empty means there is no vector at
@@ -248,6 +261,43 @@ type
     offset: seq[int32]       ## arena offset of the entry, -1 when it has none
     arena: seq[int]          ## the neighbour ids themselves
 
+  HnswHeap = object
+    ## The binary heap the walk runs on: `dists` holds the keys, `ids` the node
+    ## each key belongs to, and `n` is how many of them are live.
+    ##
+    ## `heapqueue` was costing the hot loop more than the heap is worth. It keeps
+    ## a `seq[T]` of 12-byte tuples, so consecutive comparisons land 16 bytes
+    ## apart, and every use of `.len` in the loop is a call - with
+    ## `results.len >= ef` sitting in the middle of the inner loop. Two arrays
+    ## keep the keys adjacent, `n` is a plain `int` the loop holds in a register,
+    ## and the sift moves parents into the hole instead of swapping on every
+    ## level. Nothing is ever taken out of the arrays, only `n` moves, so a push
+    ## after a pop reuses the space.
+    ##
+    ## There is one implementation and it is a min-heap. Both orderings the
+    ## search needs come from the key: `candidates` pushes `dist`, so the nearest
+    ## is on top and popped next, and `results` pushes `-dist`, so the *farthest*
+    ## is on top and evicted first. Negating a float is exact, so no ordering
+    ## changes - `worst` is the one place that convention is visible.
+    dists: seq[float32]
+    ids: seq[int]
+    n: int
+
+  SearchScratch = object
+    ## The buffers one `searchLayer` call works in, kept across calls so a walk
+    ## stops allocating after the first few.
+    ##
+    ## Per index, like `visitedStamp`, and for the same reason `searchLayer` is
+    ## not reentrant today: a query-level parallel driver will give each thread
+    ## its own searcher (or index) rather than share these. `found` is the one
+    ## field with a lifetime rule - `NeighborView` points into it, so it may not
+    ## be resized until the caller is done with the view.
+    over: seq[int]          ## visited ids at or past `count` - another writer's
+    spare: seq[int]         ## one link-list read the mirror did not have
+    candidates: HnswHeap    ## frontier, keyed on distance (nearest on top)
+    results: HnswHeap       ## the `ef` kept, keyed on `-distance` (farthest on top)
+    found: seq[Neighbor]    ## result buffer, filled farthest-first
+
   HnswIndex* = ref object
     params*: HnswParams
     dim*: int
@@ -288,28 +338,7 @@ type
     links: LinkStore        ## optional in-process mirror of the neighbour lists,
                             ## see `HnswParams.cacheLinks`; empty means every read
                             ## goes to YottaDB
-
-  HnswHeap = object
-    ## The binary heap the walk runs on: `dists` holds the keys, `ids` the node
-    ## each key belongs to, and `n` is how many of them are live.
-    ##
-    ## `heapqueue` was costing the hot loop more than the heap is worth. It keeps
-    ## a `seq[T]` of 12-byte tuples, so consecutive comparisons land 16 bytes
-    ## apart, and every use of `.len` in the loop is a call - with
-    ## `results.len >= ef` sitting in the middle of the inner loop. Two arrays
-    ## keep the keys adjacent, `n` is a plain `int` the loop holds in a register,
-    ## and the sift moves parents into the hole instead of swapping on every
-    ## level. Nothing is ever taken out of the arrays, only `n` moves, so a push
-    ## after a pop reuses the space.
-    ##
-    ## There is one implementation and it is a min-heap. Both orderings the
-    ## search needs come from the key: `candidates` pushes `dist`, so the nearest
-    ## is on top and popped next, and `results` pushes `-dist`, so the *farthest*
-    ## is on top and evicted first. Negating a float is exact, so no ordering
-    ## changes - `worst` is the one place that convention is visible.
-    dists: seq[float32]
-    ids: seq[int]
-    n: int
+    scratch: SearchScratch  ## buffers `searchLayer` reuses; see `SearchScratch`
 
 func heapPush(h: var HnswHeap, dist: float32, id: int) {.inline.} =
   ## Add `(dist, id)` to the min-heap `h`.
@@ -364,6 +393,17 @@ func worst(h: HnswHeap): float32 {.inline.} =
   ## largest distance, and this negation is the only place the convention shows.
   ## `h.n` must be > 0, which every caller's `ef` guarantees.
   -h.dists[0]
+
+func len(v: NeighborView): int {.inline.} =
+  v.n
+
+func `[]`(v: NeighborView, i: int): Neighbor {.inline.} =
+  doAssert i >= 0 and i < v.n
+  v.p[i]
+
+iterator items(v: NeighborView): Neighbor =
+  for i in 0 ..< v.n:
+    yield v.p[i]
 
 func sim*(hit: Hit): float32 =
     1.0'f32 - hit.dist
@@ -1834,16 +1874,22 @@ func seenOrMark(ix: HnswIndex, over: var seq[int], e: int, epoch: int32): bool {
   false
 
 proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
-                 ef: int, level: int): seq[Neighbor] =
+                 ef: int, level: int): NeighborView =
   ## Greedy best-first search on one layer, against the *stored* vectors (codes
-  ## for a quantized index). Returns the `ef` closest nodes found, sorted by
-  ## increasing distance.
+  ## for a quantized index). Returns the `ef` closest nodes found, nearest first,
+  ## as a view into `ix.scratch.found` - valid until the next call.
   ##
   ## Candidates and their neighbour lists are both read through the in-process
   ## mirrors (`distanceAt`, `linksAt`), so a vector or a link list they hold is
   ## used where it already sits - no per-candidate allocation, no copy, no YottaDB
   ## read. The query is borrowed into a view once, before the loop, because it is
   ## the same vector for every comparison this call makes.
+  ##
+  ## The heaps, the two small buffers and the result buffer are the index's
+  ## scratch (`SearchScratch`), reset here instead of allocated: a query runs this
+  ## once per layer and a build once per layer per insert, and the four seqs plus
+  ## their growth were pure churn. Resetting is `n = 0` because `n` is the only
+  ## thing a heap reads, and everything below it is written before it is read.
   if ix.visitedStamp.len < ix.count:
     ix.visitedStamp.setLen(ix.count)   # new slots read 0, every epoch is >= 1
   inc ix.visitEpoch
@@ -1856,43 +1902,51 @@ proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
   # is taken once, here, rather than per candidate.
   let qv = viewOf(q)
 
-  var over: seq[int]
-  var spare: seq[int]
-  var candidates = HnswHeap()
-  var results = HnswHeap()
+  ix.scratch.candidates.n = 0
+  ix.scratch.results.n = 0
+  ix.scratch.over.setLen(0)
+
   var d: float32
   for ep in entryPoints:
-    if ep < 0 or ep >= ix.count or ix.seenOrMark(over, ep, epoch):
+    if ep < 0 or ep >= ix.count or ix.seenOrMark(ix.scratch.over, ep, epoch):
       continue
     if not ix.distanceAt(qv, ep, d):
       continue                        # deleted id (e.g. a stale entry point)
-    candidates.heapPush(d, ep)
-    results.heapPush(-d, ep)
+    ix.scratch.candidates.heapPush(d, ep)
+    ix.scratch.results.heapPush(-d, ep)
 
-  while candidates.n > 0:
-    let c = candidates.heapPop()
+  while ix.scratch.candidates.n > 0:
+    let c = ix.scratch.candidates.heapPop()
     # Everything left is farther than the worst result we keep -> done.
-    if results.n >= ef and c.dist > results.worst:
+    if ix.scratch.results.n >= ef and c.dist > ix.scratch.results.worst:
       break
-    let (lp, ln) = ix.linksAt(c.id, level, spare)
+    let (lp, ln) = ix.linksAt(c.id, level, ix.scratch.spare)
     for k in 0 ..< ln:
       let e = lp[k]
-      if ix.seenOrMark(over, e, epoch):
+      if ix.seenOrMark(ix.scratch.over, e, epoch):
         continue
       if not ix.distanceAt(qv, e, d):
         # Freed id, reached through a link that neighbour pruning left one-way.
         # Treating it as "skip" keeps deleted nodes out of the result set.
         continue
-      if results.n < ef or d < results.worst:
-        candidates.heapPush(d, e)
-        results.heapPush(-d, e)
-        if results.n > ef:
-          discard results.heapPop()   # min-heap on -dist: drops the farthest
-  # Pop the max-heap to get descending order, then reverse to ascending.
-  while results.n > 0:
-    let r = results.heapPop()
-    result.add (dist: -r.dist, id: r.id)
-  result.reverse()
+      if ix.scratch.results.n < ef or d < ix.scratch.results.worst:
+        ix.scratch.candidates.heapPush(d, e)
+        ix.scratch.results.heapPush(-d, e)
+        if ix.scratch.results.n > ef:
+          # min-heap on -dist: drops the farthest
+          discard ix.scratch.results.heapPop()
+  # The heap pops farthest first; fill from the end so the caller gets ascending
+  # order without a separate reverse pass.
+  let n = ix.scratch.results.n
+  ix.scratch.found.setLen(n)
+  if n == 0:
+    return NeighborView(p: nil, n: 0)
+  var i = n - 1
+  while ix.scratch.results.n > 0:
+    let r = ix.scratch.results.heapPop()
+    ix.scratch.found[i] = (dist: -r.dist, id: r.id)
+    dec i
+  NeighborView(p: cast[ptr UncheckedArray[Neighbor]](ix.scratch.found[0].addr), n: n)
 
 proc selectNeighbors(ix: HnswIndex, candidates: seq[Neighbor], m: int,
                      provided: openArray[VecView] = [],
