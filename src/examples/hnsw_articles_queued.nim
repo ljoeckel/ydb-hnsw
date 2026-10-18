@@ -1,12 +1,12 @@
 ## Build (or extend) the HNSW index over the article embeddings, with the graph
 ## persisted in YottaDB.
 
-import std/[os, strformat, strutils, times, enumerate]
-import ../ydbhnsw
+import std/[strformat, strutils, times, enumerate]
+import ydbhnsw
 import hnsw_common
 import types
 
-let started = epochTime()
+var started: float
 
 proc logInfo(cnt: int) =
     let ips = cnt.float / (epochTime() - started)
@@ -21,6 +21,7 @@ when isMainModule:
 
     var ix = openHnsw(params)
     var total = 0
+    started = epochTime()
 
     for (cnt, iterResult) in enumerate(batchedRSSTitleIter(ix)):
         if cnt >= params.limit:  break

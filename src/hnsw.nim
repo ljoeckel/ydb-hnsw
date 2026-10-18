@@ -311,7 +311,7 @@ type
     ids: seq[int]
     n: int
 
-proc heapPush(h: var HnswHeap, dist: float32, id: int) {.inline.} =
+func heapPush(h: var HnswHeap, dist: float32, id: int) {.inline.} =
   ## Add `(dist, id)` to the min-heap `h`.
   ##
   ## The arena doubles, so re-heaping a whole layer's frontier does not
@@ -334,7 +334,7 @@ proc heapPush(h: var HnswHeap, dist: float32, id: int) {.inline.} =
   h.dists[i] = dist
   h.ids[i] = id
 
-proc heapPop(h: var HnswHeap): tuple[dist: float32, id: int] {.inline.} =
+func heapPop(h: var HnswHeap): tuple[dist: float32, id: int] {.inline.} =
   ## Remove and return the smallest key. `h.n` has to be > 0 - the walk checks
   ## it, because a heap it can empty is how a layer ends.
   result = (h.dists[0], h.ids[0])
@@ -358,16 +358,14 @@ proc heapPop(h: var HnswHeap): tuple[dist: float32, id: int] {.inline.} =
     h.dists[i] = dist
     h.ids[i] = id
 
-proc worst(h: HnswHeap): float32 {.inline.} =
+func worst(h: HnswHeap): float32 {.inline.} =
   ## The distance the `results` heap would evict next: the farthest the walk is
   ## still keeping. That heap is the min-heap keyed on `-dist`, so its top is the
   ## largest distance, and this negation is the only place the convention shows.
   ## `h.n` must be > 0, which every caller's `ef` guarantees.
   -h.dists[0]
 
-proc cmpNeighbor(a, b: Neighbor): int = cmp(a.dist, b.dist)
-
-proc sim*(hit: Hit): float32 =
+func sim*(hit: Hit): float32 =
     1.0'f32 - hit.dist
 
 
@@ -390,7 +388,7 @@ const Latin1Fold: array[0xC0 .. 0xFF, string] = [
   "oe", "u", "u", "u", "ue", "y", "th", "y",
 ]
 
-proc foldLetter*(r: Rune): string =
+func foldLetter*(r: Rune): string =
   ## Transliterate one letter to plain ASCII.
   ##
   ## Latin-1 accents are folded away (é -> e, ñ -> n) and the letters that stand
@@ -406,7 +404,7 @@ proc foldLetter*(r: Rune): string =
   else:
     r.toUTF8
 
-proc hnswNormalize*(title: string): string =
+func hnswNormalize*(title: string): string =
     ## Normalised form of a title: lower-cased, transliterated to plain letters,
     ## and reduced to words of `[a-z0-9]` separated by single spaces.
     ##
@@ -446,7 +444,7 @@ proc hnswNormalize*(title: string): string =
 # binary encoding
 # ---------------------------------------------------------------------------
 
-proc bytesPerVector*(ix: HnswIndex): int =
+func bytesPerVector*(ix: HnswIndex): int =
     ## What one stored vector costs, from the mode and the dimension alone - the
     ## blobs do not have to be read back for this.
     case ix.params.quant
@@ -454,7 +452,7 @@ proc bytesPerVector*(ix: HnswIndex): int =
     of vqInt8: 4 + ix.dim
     of vqInt8Fixed: ix.dim
 
-proc linkBytes*(fmt: LinkFmt): int =
+func linkBytes*(fmt: LinkFmt): int =
     ## What one stored neighbour id costs, so a level-0 list of `2M` links is
     ## `2M * linkBytes` bytes. The width is a property of the index, not of the
     ## process, so it has to be asked for rather than looked up.
@@ -463,18 +461,18 @@ proc linkBytes*(fmt: LinkFmt): int =
     of lfUint32: sizeof(uint32)
 
 
-proc packFloats*(xs: openArray[float32]): string =
+func packFloats*(xs: openArray[float32]): string =
   result = newString(xs.len * sizeof(float32))
   if xs.len > 0:
     copyMem(result[0].addr, xs[0].unsafeAddr, xs.len * sizeof(float32))
 
-proc unpackFloats*(s: string): seq[float32] =
+func unpackFloats*(s: string): seq[float32] =
   let n = s.len div sizeof(float32)
   result = newSeqUninit[float32](n)
   if n > 0:
     copyMem(result[0].addr, s[0].unsafeAddr, n * sizeof(float32))
 
-proc packLinks(fmt: LinkFmt, xs: openArray[int]): string =
+func packLinks(fmt: LinkFmt, xs: openArray[int]): string =
   ## One neighbour list as it goes into YottaDB, in the index's link width.
   ##
   ## `lfUint32` is the only place an id could be lost, and the range it can lose
@@ -496,7 +494,7 @@ proc packLinks(fmt: LinkFmt, xs: openArray[int]): string =
         doAssert x >= 0 and uint64(x) <= uint64(high(uint32))
         dst[i] = uint32(x)
 
-proc unpackLinks(fmt: LinkFmt, s: string): seq[int] =
+func unpackLinks(fmt: LinkFmt, s: string): seq[int] =
   ## Inverse of `packLinks`, always back into `int` - the width is the on-disk
   ## detail, the graph works in ids.
   ##
@@ -537,7 +535,7 @@ proc unpackLinks(fmt: LinkFmt, s: string): seq[int] =
 #     the SIMD and scalar builds are not bit-identical.
 
 when defined(hnswSimd):
-  proc simdDotF32(pa, pb: ptr UncheckedArray[float32], n: int): float32 =
+  func simdDotF32(pa, pb: ptr UncheckedArray[float32], n: int): float32 =
     ## AVX dot product: 8 floats per multiply, 32 per iteration over four
     ## independent accumulators. Four, not one, because a single `acc = acc + x*y`
     ## chain is bound by the add's 3-cycle latency and would run at a third of the
@@ -575,7 +573,7 @@ when defined(hnswSimd):
       result += pa[i] * pb[i]
       inc i
 
-  proc simdDotI8(pa, pb: ptr UncheckedArray[int8], n: int): int32 =
+  func simdDotI8(pa, pb: ptr UncheckedArray[int8], n: int): int32 =
     ## int8 dot product in 128-bit integer SIMD. This machine has AVX but not
     ## AVX2, so there is no 256-bit integer path to take - but 128 bits still
     ## beats scalar by a wide margin: `pmovsxbw` widens 8 bytes to int16 and
@@ -603,7 +601,7 @@ when defined(hnswSimd):
       result += int32(pa[i]) * int32(pb[i])
       inc i
 
-proc normalize*(v: var seq[float32]) =
+func normalize*(v: var seq[float32]) =
   when defined(hnswSimd):
     ## Two vectorized passes - sum the squares, then scale by 1/norm. Scaling by
     ## the reciprocal instead of dividing per component is a small accuracy trade
@@ -647,7 +645,7 @@ proc normalize*(v: var seq[float32]) =
       for i in 0 ..< v.len:
         v[i] = v[i] / norm
 
-proc dot(a, b: openArray[float32]): float32 =
+func dot(a, b: openArray[float32]): float32 =
   ## The float32 distance kernel. `openArray`, not `seq`, so it can run on a
   ## `VecView` - a slice of the cache arena or of a `StoredVec` - without either
   ## side being copied: the SIMD body only ever needs the address and the length,
@@ -692,7 +690,7 @@ const
     ## stays symmetric around zero and the round-trip error is bounded by
     ## `scale / 2` on both sides instead of one side getting a half step extra.
 
-proc quantizeScale*(vectors: openArray[seq[float32]]): float32 =
+func quantizeScale*(vectors: openArray[seq[float32]]): float32 =
   ## Shared step size for a whole collection: `max|x| / 127` over every
   ## component of every vector.
   ##
@@ -706,7 +704,7 @@ proc quantizeScale*(vectors: openArray[seq[float32]]): float32 =
         maxAbs = a
   if maxAbs > 0: maxAbs / float32(QuantMax) else: 1.0'f32
 
-proc quantizeInt8*(v: openArray[float32], scale: float32,
+func quantizeInt8*(v: openArray[float32], scale: float32,
                    clamped: var int): seq[int8] =
   ## As above, but counts the components that had to be clamped to the grid in
   ## `clamped` (incremented, not reset). A non-zero count means `scale` is too
@@ -728,7 +726,7 @@ proc quantizeInt8*(v: openArray[float32], scale: float32,
       inc clamped
     result[i] = int8(q)
 
-proc quantizeInt8*(v: openArray[float32], scale: float32): seq[int8] =
+func quantizeInt8*(v: openArray[float32], scale: float32): seq[int8] =
   ## Scalar quantization of one vector on a given grid: one signed byte per
   ## component, `x ~= result[i] * scale`.
   ##
@@ -738,7 +736,7 @@ proc quantizeInt8*(v: openArray[float32], scale: float32): seq[int8] =
   var clamped = 0
   quantizeInt8(v, scale, clamped)
 
-proc quantizeInt8*(v: openArray[float32]): tuple[codes: seq[int8], scale: float32] =
+func quantizeInt8*(v: openArray[float32]): tuple[codes: seq[int8], scale: float32] =
   ## Scalar quantization of one vector on its own grid, returning the codes and
   ## the scale they belong to. Round-trip with
   ## `dequantizeInt8(codes, scale)`, compare with `dotInt8(a, b, sa, sb)`.
@@ -750,14 +748,14 @@ proc quantizeInt8*(v: openArray[float32]): tuple[codes: seq[int8], scale: float3
   result.scale = if maxAbs > 0: maxAbs / float32(QuantMax) else: 1.0'f32
   result.codes = quantizeInt8(v, result.scale)
 
-proc dequantizeInt8*(codes: openArray[int8], scale: float32): seq[float32] =
+func dequantizeInt8*(codes: openArray[int8], scale: float32): seq[float32] =
   ## Back to float32: `code * scale`. This is the lossy step; every component is
   ## off by at most `scale / 2`.
   result = newSeqUninit[float32](codes.len)
   for i, c in codes:
     result[i] = float32(c) * scale
 
-proc dotInt8*(a, b: openArray[int8], scaleA = 1.0'f32,
+func dotInt8*(a, b: openArray[int8], scaleA = 1.0'f32,
               scaleB = 1.0'f32): float32 =
   ## Dot product of two quantized vectors: the codes are multiplied and summed
   ## in int32, so that part is exact (127 * 127 * 4096 stays far below 2^31) and
@@ -778,7 +776,7 @@ proc dotInt8*(a, b: openArray[int8], scaleA = 1.0'f32,
       acc += int32(a[i]) * int32(b[i])
     float32(acc) * scaleA * scaleB
 
-proc packInt8*(xs: openArray[int8]): string =
+func packInt8*(xs: openArray[int8]): string =
   ## A dim-byte blob for YottaDB - a quarter of what `packFloats` writes for the
   ## same vector. The scale cannot be recovered from the bytes, so store it
   ## alongside (a second YottaDB node, or once in META if the whole collection
@@ -787,7 +785,7 @@ proc packInt8*(xs: openArray[int8]): string =
   if xs.len > 0:
     copyMem(result[0].addr, xs[0].unsafeAddr, xs.len)
 
-proc unpackInt8*(s: string): seq[int8] =
+func unpackInt8*(s: string): seq[int8] =
   ## Inverse of `packInt8`: one byte per dimension, `s.len` == dim.
   result = newSeqUninit[int8](s.len)
   if s.len > 0:
@@ -798,7 +796,7 @@ proc unpackInt8*(s: string): seq[int8] =
 # vector storage
 # ---------------------------------------------------------------------------
 
-proc packQVec(scale: float32, codes: openArray[int8]): string =
+func packQVec(scale: float32, codes: openArray[int8]): string =
   ## A quantized vector as stored: the float32 scale first, then one byte per
   ## dimension, so a single YottaDB read gets both halves (4 + dim bytes).
   result = newString(sizeof(float32) + codes.len)
@@ -806,7 +804,7 @@ proc packQVec(scale: float32, codes: openArray[int8]): string =
   if codes.len > 0:
     copyMem(result[sizeof(float32)].addr, codes[0].unsafeAddr, codes.len)
 
-proc unpackQVec(s: string): StoredVec =
+func unpackQVec(s: string): StoredVec =
   ## Inverse of `packQVec`. An empty string - or anything without room for the
   ## scale - means there is no vector at that id.
   if s.len <= sizeof(float32):
@@ -816,11 +814,11 @@ proc unpackQVec(s: string): StoredVec =
   result.scale = scale
   result.codes = unpackInt8(s[sizeof(float32) .. ^1])
 
-proc isMissing(v: StoredVec): bool =
+func isMissing(v: StoredVec): bool =
   ## True when the id has no vector: deleted, or never written.
   v.floats.len == 0 and v.codes.len == 0
 
-proc viewOf(v: StoredVec): VecView =
+func viewOf(v: StoredVec): VecView =
   ## Borrowed view of an owning `StoredVec`: the address of its codes or floats,
   ## and the scale that goes with the codes. Nothing is copied and nothing is
   ## owned - the seq has to outlive the view.
@@ -832,18 +830,18 @@ proc viewOf(v: StoredVec): VecView =
     result.floats = cast[ptr UncheckedArray[float32]](v.floats[0].unsafeAddr)
     result.dim = v.floats.len
 
-proc dotCacheF32(q, v: ptr UncheckedArray[float32], n: int): float32 {.inline.} =
+func dotCacheF32(q, v: ptr UncheckedArray[float32], n: int): float32 {.inline.} =
   ## The float32 kernel on two raw buffers: `dot` is still the only
   ## implementation, this is just the shape the walk wants, with the length
   ## already in hand.
   dot(toOpenArray(q, 0, n - 1), toOpenArray(v, 0, n - 1))
 
-proc dotCacheI8(q: ptr UncheckedArray[int8], qs: float32,
+func dotCacheI8(q: ptr UncheckedArray[int8], qs: float32,
                 v: ptr UncheckedArray[int8], vs: float32, n: int): float32 {.inline.} =
   ## The int8 kernel on two raw buffers, with both scales in hand.
   dotInt8(toOpenArray(q, 0, n - 1), toOpenArray(v, 0, n - 1), qs, vs)
 
-proc dotView(a, b: VecView): float32 {.inline.} =
+func dotView(a, b: VecView): float32 {.inline.} =
   ## Dot product of two vectors held as views: the same `dot` / `dotInt8` kernels,
   ## run on bytes that are already in memory (the cache arena, or a `StoredVec`)
   ## instead of on a fresh copy of them.
@@ -861,20 +859,11 @@ proc dotView(a, b: VecView): float32 {.inline.} =
   else:
     0.0'f32
 
-proc distanceView(a, b: VecView): float32 {.inline.} =
+func distanceView(a, b: VecView): float32 {.inline.} =
   ## Cosine distance between two L2-normalised stored vectors, both borrowed.
   1.0'f32 - dotView(a, b)
 
-proc dotStored(a, b: StoredVec): float32 =
-  ## `dotView` for two owning vectors - what the insert path and the
-  ## not-in-cache fallback still hand in.
-  dotView(viewOf(a), viewOf(b))
-
-proc distanceStored(a, b: StoredVec): float32 =
-  ## Cosine distance between two L2-normalised stored vectors.
-  1.0'f32 - dotStored(a, b)
-
-proc cacheSlot(ix: HnswIndex, id: int): int =
+func cacheSlot(ix: HnswIndex, id: int): int =
   ## The slot holding `id`'s vector, or -1 when the cache has none for it: an id
   ## outside the index, one whose vector was never mirrored, or a deleted one.
   ##
@@ -931,6 +920,37 @@ proc loadVec*(ix: HnswIndex, id: int): StoredVec =
   of vqInt8Fixed:
     result.scale = ix.params.quantScale
     result.codes = unpackInt8(s)
+
+proc vecViewAt(ix: HnswIndex, id: int, holder: var StoredVec): VecView =
+  ## Borrowed view of `id`'s vector, for the paths that compare many vectors
+  ## with each other instead of scoring one query against each of them.
+  ##
+  ## A cached vector is viewed where it lies. An id the cache does not hold -
+  ## deleted, not mirrored, or no cache at all - is loaded into `holder`, so the
+  ## caller has to keep `holder` alive for as long as it uses the view, and must
+  ## not write a vector in between (a write can grow the arena). That is the same
+  ## lifetime rule `VecView` carries everywhere else, and `selectNeighbors` meets
+  ## it: it only reads.
+  ##
+  ## The decode is `loadVec`'s - same fields for the same mode, same scale - and a
+  ## missing id yields a `dim == 0` view, which every distance treats as "no
+  ## vector", exactly as `isMissing` did.
+  let slot = ix.cacheSlot(id)
+  if slot >= 0 and ix.cache.dim > 0:
+    let base = slot * ix.cache.dim
+    if ix.params.quant == vqNone:
+      result.floats = cast[ptr UncheckedArray[float32]](
+        ix.cache.floats[base].unsafeAddr)
+    else:
+      result.codes = cast[ptr UncheckedArray[int8]](
+        ix.cache.codes[base].unsafeAddr)
+      # vqInt8 carries a scale per vector, vqInt8Fixed one for the whole index.
+      result.scale = if ix.params.quant == vqInt8: ix.cache.scales[slot]
+                     else: ix.params.quantScale
+    result.dim = ix.cache.dim
+    return
+  holder = ix.loadVec(id)
+  result = viewOf(holder)
 
 proc distanceAt(ix: HnswIndex, q: VecView, id: int, dist: var float32): bool {.inline.} =
   ## Distance from the query view `q` to node `id`, and whether `id` has a vector
@@ -1015,10 +1035,10 @@ proc lookup*(ix: HnswIndex, key: string): int =
 # has to be invalidated wholesale, because every write this process makes goes
 # through `putLinks` or `linksForget`.
 
-proc linksIdx(ix: HnswIndex, id, level: int): int {.inline.} =
+func linksIdx(ix: HnswIndex, id, level: int): int {.inline.} =
   id * ix.links.stride + level
 
-proc linksGrow(ix: HnswIndex, id, level: int) =
+func linksGrow(ix: HnswIndex, id, level: int) =
   ## Make the table cover `(id, level)`.
   ##
   ## Both dimensions grow *geometrically*, and that is the whole point of this
@@ -1068,7 +1088,7 @@ proc linksGrow(ix: HnswIndex, id, level: int) =
       ix.links.offset[i] = -1
     ix.links.ids = newIds
 
-proc linksKnown(ix: HnswIndex, id, level: int): int32 {.inline.} =
+func linksKnown(ix: HnswIndex, id, level: int): int32 {.inline.} =
   ## What the mirror knows about `(id, level)`: -1 not mirrored, 0 mirrored and
   ## empty, n > 0 mirrored with n ids.
   if not ix.params.cacheLinks or id < 0 or level < 0 or
@@ -1076,7 +1096,7 @@ proc linksKnown(ix: HnswIndex, id, level: int): int32 {.inline.} =
     return -1
   ix.links.lens[linksIdx(ix, id, level)]
 
-proc linksStore(ix: HnswIndex, id, level: int, links: openArray[int]) =
+func linksStore(ix: HnswIndex, id, level: int, links: openArray[int]) =
   ## Record what `(id, level)` holds. Both callers pass the truth - `putLinks`
   ## after a successful write, the fill path with whatever YottaDB returned - so
   ## an empty list is recorded as empty rather than erased: "no links" is a real
@@ -1099,7 +1119,7 @@ proc linksStore(ix: HnswIndex, id, level: int, links: openArray[int]) =
   copyMem(ix.links.arena[int(ix.links.offset[i])].addr, links[0].unsafeAddr,
           links.len * sizeof(int))
 
-proc linksForget(ix: HnswIndex, id, level: int) =
+func linksForget(ix: HnswIndex, id, level: int) =
   ## `(id, level)` has no list any more - `unlink` deleting the node it emptied.
   ## The slot is kept and recorded empty, so a later read of it does not go back
   ## to YottaDB to be told the same thing.
@@ -1108,7 +1128,7 @@ proc linksForget(ix: HnswIndex, id, level: int) =
   if id < ix.links.ids and level < ix.links.stride:
     ix.links.lens[linksIdx(ix, id, level)] = 0
 
-proc linksForgetAll(ix: HnswIndex, id: int) =
+func linksForgetAll(ix: HnswIndex, id: int) =
   ## Drop every layer of `id`: the mirror's side of deleting the node's
   ## `^...LINKS` subtree.
   if not ix.params.cacheLinks or id < 0 or id >= ix.links.ids:
@@ -1165,7 +1185,7 @@ proc getLinks(ix: HnswIndex, id, level: int): seq[int] =
   result = newSeqUninit[int](n)
   copyMem(result[0].addr, p, n * sizeof(int))
 
-proc refreshLinks*(ix: HnswIndex) =
+func refreshLinks*(ix: HnswIndex) =
   ## Drop every mirrored neighbour list, so the next read of each comes from
   ## YottaDB again - what a long-running reader does once a *second* process has
   ## relinked nodes in the same index.
@@ -1214,7 +1234,7 @@ proc bumpLive(ix: HnswIndex, delta: int) =
     ix.metaSet("live", $ix.live)
   ix.live = ydb_increment(ix.params.globalMeta, @["live"], delta)
 
-proc maxLinks*(ix: HnswIndex, level: int): int =
+func maxLinks*(ix: HnswIndex, level: int): int =
   ## Level 0 keeps twice as many links - that is where the whole graph gets
   ## walked, so it pays for itself there.
   if level == 0: 2 * ix.params.M else: ix.params.M
@@ -1225,7 +1245,7 @@ proc maxLinks*(ix: HnswIndex, level: int): int =
 # in-process vector cache
 # ---------------------------------------------------------------------------
 
-proc cacheOn(ix: HnswIndex): bool =
+func cacheOn(ix: HnswIndex): bool =
   ## Whether this index mirrors its vectors in process memory - the `cacheVectors`
   ## setting, not "the id map has entries".
   ##
@@ -1236,7 +1256,7 @@ proc cacheOn(ix: HnswIndex): bool =
   ## and only start caching after a reopen.
   ix.params.cacheVectors
 
-proc cacheInit(ix: HnswIndex) =
+func cacheInit(ix: HnswIndex) =
   ## Bring the cache arena in line with the index's dimension.
   ##
   ## For an index opened with vectors the two already agree: `preloadVectors`
@@ -1248,7 +1268,7 @@ proc cacheInit(ix: HnswIndex) =
   if ix.params.cacheVectors and ix.dim > 0 and ix.cache.dim != ix.dim:
     ix.cache.dim = ix.dim
 
-proc cacheIds(ix: HnswIndex, count: int) =
+func cacheIds(ix: HnswIndex, count: int) =
   ## Make the id -> slot map cover every id below `count`. This is the one part
   ## still keyed by id and so the one part that grows with `count` - which is why
   ## it is a plain int seq and not a second arena.
@@ -1259,7 +1279,7 @@ proc cacheIds(ix: HnswIndex, count: int) =
   for i in have ..< count:
     ix.cache.idToSlot[i] = -1
 
-proc cacheReserve(ix: HnswIndex, slots: int) =
+func cacheReserve(ix: HnswIndex, slots: int) =
   ## Make room for at least `slots` vectors, and never for fewer - a slot a delete
   ## frees is handed out again by the next `cachePut`, so the reservation does not
   ## have to follow `nSlots` back down.
@@ -1280,7 +1300,7 @@ proc cacheReserve(ix: HnswIndex, slots: int) =
   of vqInt8Fixed:
     ix.cache.codes.setLen(slots * ix.cache.dim)
 
-proc cachePut(ix: HnswIndex, id: int, v: StoredVec) =
+func cachePut(ix: HnswIndex, id: int, v: StoredVec) =
   ## Mirror `v` into the cache. Called from `putVec`, so every write this index
   ## makes keeps the cache coherent and an insert never invalidates it.
   if not ix.cacheOn:
@@ -1311,7 +1331,7 @@ proc cachePut(ix: HnswIndex, id: int, v: StoredVec) =
     if v.codes.len == ix.cache.dim:
       copyMem(ix.cache.codes[base].addr, v.codes[0].unsafeAddr, ix.cache.dim)
 
-proc cacheFree(ix: HnswIndex, id: int) =
+func cacheFree(ix: HnswIndex, id: int) =
   ## Drop `id`'s vector from the cache, handing the slot back by swapping the last
   ## one into it. That keeps slots `0 ..< nSlots` exactly the vectors that are
   ## there - no hole per deleted id, which is the whole point of the dense store -
@@ -1455,7 +1475,7 @@ proc preloadVectors*(ix: HnswIndex): int =
     ix.metaSet("live", $result)
   echo "'Vector' cache loaded with ", result, " entries in ", $(now() - t1).inMilliseconds, " ms."
 
-proc cachedVectors*(ix: HnswIndex): int =
+func cachedVectors*(ix: HnswIndex): int =
   ## How many vectors the in-process cache holds (0 when there is none). O(1) now
   ## that the store is dense, instead of a scan over the whole id range.
   ix.cache.nSlots
@@ -1474,7 +1494,7 @@ proc putVec(ix: HnswIndex, id: int, v: StoredVec) =
   
   ix.cachePut(id, v)
 
-proc toStored(ix: HnswIndex, v: seq[float32]): StoredVec =
+func toStored(ix: HnswIndex, v: seq[float32]): StoredVec =
   ## Encode an L2-normalised vector the way this index stores it. This is the
   ## only place a vector is quantized, so insertion, repair and search cannot
   ## disagree about the grid.
@@ -1499,7 +1519,7 @@ proc setModelLoader*(loader: ModelLoader) =
   ## `ModelLoader`. `bert_nim.loadModel` is what the embedding side registers.
   modelLoader = loader
 
-proc deriveGlobalNames(p: var HnswParams) =
+func deriveGlobalNames(p: var HnswParams) =
   ## Fill in the `^...NODE` / `^...KEY` / `^...META` names that belong to
   ## `p.global`, unless a caller named them itself.
   if p.globalNode.len == 0:
@@ -1510,7 +1530,7 @@ proc deriveGlobalNames(p: var HnswParams) =
     p.globalMeta = p.global & "META"
     p.globalQueue = p.global & "QUEUE"
 
-proc hnswParams*(global: string, model = DefaultModel,
+func hnswParams*(global: string, model = DefaultModel,
                  M = 16, efConstruction = 200, efSearch = 64, seed = 1234,
                  dim = 0, quant = vqNone, quantScale = 0.0'f32,
                  linkFmt = lfUInt32,
@@ -1763,7 +1783,7 @@ proc hasId*(ix: HnswIndex, id: int): bool =
     return ix.cache.idToSlot[id] >= 0
   ydb_data(ix.params.globalNode, @[$id]) != 0
 
-proc liveCount*(ix: HnswIndex): int =
+func liveCount*(ix: HnswIndex): int =
   ## Number of nodes actually in the graph (`ix.count` is the id high-water
   ## mark instead, which is >= this once anything has been deleted).
   ix.live
@@ -1783,7 +1803,7 @@ proc nodeCount*(global: string): int =
 # graph construction
 # ---------------------------------------------------------------------------
 
-proc randomLevel(ix: HnswIndex): int =
+func randomLevel(ix: HnswIndex): int =
   ## Exponentially decaying level draw: most nodes land on layer 0, a few get
   ## promoted, which is what gives the structure its log-time descent.
   let mL = 1.0 / ln(ix.params.M.float)
@@ -1791,7 +1811,7 @@ proc randomLevel(ix: HnswIndex): int =
   let u = max(rand(ix.rng, 1.0), 1e-12)
   int(floor(-ln(u) * mL))
 
-proc seenOrMark(ix: HnswIndex, over: var seq[int], e: int, epoch: int32): bool {.inline.} =
+func seenOrMark(ix: HnswIndex, over: var seq[int], e: int, epoch: int32): bool {.inline.} =
   ## True when node `e` is already visited under `epoch`; marks it and returns
   ## false otherwise.
   ##
@@ -1875,6 +1895,7 @@ proc searchLayer(ix: HnswIndex, q: StoredVec, entryPoints: openArray[int],
   result.reverse()
 
 proc selectNeighbors(ix: HnswIndex, candidates: seq[Neighbor], m: int,
+                     provided: openArray[VecView] = [],
                      keepPruned = false): seq[int] =
   ## Malkov & Yashunin Algorithm 4, run on stored vectors. Candidates are
   ## accepted only when they are closer to the base vector than to every
@@ -1883,25 +1904,50 @@ proc selectNeighbors(ix: HnswIndex, candidates: seq[Neighbor], m: int,
   ## already in `candidates`, so the heuristic only needs the vectors to compare
   ## candidates with each other.
   ##
-  ## Those vectors are loaded once up front: the naive version re-read the same
-  ## blobs from YottaDB once per pairwise comparison, i.e. O(m^2) reads per layer
-  ## per insert instead of O(m) - and with the codes in hand the comparisons
-  ## themselves are int8 multiply-adds.
-  var sorted = candidates
-  sorted.sort(cmpNeighbor)
+  ## The candidates are examined in increasing distance and their vectors are
+  ## borrowed as views, one at a time: a cached vector is compared where it lies
+  ## (no allocation, no copy), and only the candidates the heuristic actually
+  ## reaches are loaded at all - it stops as soon as `m` have been accepted,
+  ## which is usually well before the `efConstruction`-wide list is used up. The
+  ## old version loaded every candidate up front, as an owning `StoredVec`.
+  ##
+  ## `provided`, when it holds one vector per candidate *in candidate order*, is
+  ## used instead of loading them: `connect`'s pruning path has already loaded
+  ## the list to compute the distances to `n`. The caller keeps those views - and
+  ## whatever they point at - alive for the duration of the call.
+  ##
+  ## Borrowing the bytes is safe for the same reason it is in `searchLayer`: this
+  ## is a read-only pass, so nothing reaches `cacheReserve` / `setLen` while the
+  ## views are in use.
+  var order = newSeq[int](candidates.len)
+  for i in 0 ..< order.len:
+    order[i] = i
+  # Sorting positions rather than the candidates keeps the vectors aligned with
+  # them. `sort` is stable, so candidates at equal distance keep the order they
+  # arrived in - the same order the old in-place sort produced.
+  order.sort(proc(a, b: int): int = cmp(candidates[a].dist, candidates[b].dist))
 
-  var vecs = newSeq[StoredVec](sorted.len)
-  for i in 0 ..< sorted.len:
-    vecs[i] = ix.loadVec(sorted[i].id)
+  let haveProvided = provided.len == candidates.len
+  var views = newSeq[VecView](order.len)
+  var owned: seq[StoredVec]
+  if haveProvided:
+    for i in 0 ..< order.len:
+      views[i] = provided[order[i]]
+  else:
+    # One allocation holding the fallback loads, instead of one per candidate.
+    owned = newSeq[StoredVec](order.len)
 
   var chosen: seq[int]
   var pruned: seq[int]
-  for i in 0 ..< sorted.len:
+  for i in 0 ..< order.len:
     if chosen.len >= m:
       break
+    let ci = order[i]
+    if not haveProvided:
+      views[i] = ix.vecViewAt(candidates[ci].id, owned[i])
     var keep = true
     for j in chosen:
-      if distanceStored(vecs[i], vecs[j]) < sorted[i].dist:
+      if distanceView(views[i], views[j]) < candidates[ci].dist:
         keep = false
         break
     if keep:
@@ -1910,13 +1956,13 @@ proc selectNeighbors(ix: HnswIndex, candidates: seq[Neighbor], m: int,
       pruned.add i
 
   for i in chosen:
-    result.add sorted[i].id
+    result.add candidates[order[i]].id
   if keepPruned:
     # Fill up with the discarded ones rather than returning fewer than `m`.
     for i in pruned:
       if result.len >= m:
         break
-      result.add sorted[i].id
+      result.add candidates[order[i]].id
 
 proc connect(ix: HnswIndex, id: int, vec: StoredVec, level: int, ep: var int) =
   ## Give `id` neighbours on one layer: search for candidates, pick them with the
@@ -1948,12 +1994,19 @@ proc connect(ix: HnswIndex, id: int, vec: StoredVec, level: int, ep: var int) =
     nLinks.add id
     let limit = ix.maxLinks(level)
     if nLinks.len > limit:
-      # Re-run the heuristic from n's point of view.
-      let nVec = ix.loadVec(n)
-      var cands: seq[Neighbor]
-      for x in nLinks:
-        cands.add (dist: distanceStored(nVec, ix.loadVec(x)), id: x)
-      nLinks = ix.selectNeighbors(cands, limit)
+      # Re-run the heuristic from n's point of view. Each candidate vector is
+      # loaded once - the distance to `n` needs it, and so does the selection -
+      # and `n` itself is a view rather than a copy. The old version loaded `n`
+      # plus every candidate twice more inside `selectNeighbors`.
+      var nHolder: StoredVec
+      let base = ix.vecViewAt(n, nHolder)
+      var owned = newSeq[StoredVec](nLinks.len)
+      var views = newSeq[VecView](nLinks.len)
+      var cands = newSeq[Neighbor](nLinks.len)
+      for i in 0 ..< nLinks.len:
+        views[i] = ix.vecViewAt(nLinks[i], owned[i])
+        cands[i] = (dist: distanceView(base, views[i]), id: nLinks[i])
+      nLinks = ix.selectNeighbors(cands, limit, views)
     ix.putLinks(n, level, nLinks)
 
   ep = w[0].id
