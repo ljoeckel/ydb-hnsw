@@ -25,6 +25,7 @@ usage: <program> [option=value]...
                       Use 'NONE' to indicate not to load the model.
   --scale=FLOAT       int8 grid for --quant=int8fixed. "auto" (the default in that
                       mode) derives it from --sample real embeddings.
+  --cache=BOOL        Enable/disable both caches (Vector/Links) 
   --cacheVectors=BOOL Cache all vectors
   --preloadCacheVectors=BOOL Preload at start (defaults to true)
   --cacheLinks=BOOL   Cache the links
@@ -162,6 +163,12 @@ proc parseArgs(global: string, model: string): HNSWOptions =
             else:
                 result.scale = float32(parseFloat(val))
                 result.scaleAuto = false
+        of "cache":
+            let caching = parseBool(val)
+            result.cacheVectors = caching
+            result.cacheLinks = caching
+            result.preloadCacheVectors = caching
+            result.preloadCacheLinks = caching
         of "cachevectors": 
             result.cacheVectors = parseBool(val)
         of "preloadcachevectors": 

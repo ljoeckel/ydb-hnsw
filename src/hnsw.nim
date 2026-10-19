@@ -214,7 +214,9 @@ type
     ## distance with that and throws it away: on the article index a couple of
     ## thousand 1536-byte allocations and copies per query, every one of them
     ## discarded. A view costs a pointer and a length instead, and the distance
-    ## runs on the arena's own bytes (`dotView`, `distanceAt`).
+    ## runs on the arena's own bytes (`dotView`, `distanceAt`) - or, for an id the
+    ## cache does not hold, on the `^...NODE` blob that was just read
+    ## (`storedView`), which removes the same allocation from the fallback.
     ##
     ## What a view costs *instead* is a lifetime rule: it points into a seq it
     ## does not own, so it may only be used while that seq is alive - and, for
@@ -937,10 +939,6 @@ func unpackQVec(s: string): StoredVec =
   result.scale = scale
   result.codes = unpackInt8(s[sizeof(float32) .. ^1])
 
-func isMissing(v: StoredVec): bool =
-  ## True when the id has no vector: deleted, or never written.
-  v.floats.len == 0 and v.codes.len == 0
-
 func viewOf(v: StoredVec): VecView =
   ## Borrowed view of an owning `StoredVec`: the address of its codes or floats,
   ## and the scale that goes with the codes. Nothing is copied and nothing is
@@ -952,6 +950,40 @@ func viewOf(v: StoredVec): VecView =
   elif v.floats.len > 0:
     result.floats = cast[ptr UncheckedArray[float32]](v.floats[0].unsafeAddr)
     result.dim = v.floats.len
+
+func storedView(ix: HnswIndex, blob: string): VecView =
+  ## Decode one `^...NODE` value into a view, the way `ix.params.quant` says it
+  ## was written: the float32 vector, or the codes with the scale they belong to.
+  ## Nothing is copied - the view points into `blob`, which the caller has to keep
+  ## alive for as long as the view is used.
+  ##
+  ## A blob that is not exactly `bytesPerVector` long - or an index that records
+  ## no dimension - yields `dim == 0`, the "no vector" view every distance treats
+  ## as absent. That is the single decode for a stored blob: `blobView` raises on
+  ## it, because a query blob of the wrong width is the caller's bug, and
+  ## `distanceAt` skips the candidate, because a neighbour's blob is whatever the
+  ## database holds. `loadVec` is the owning counterpart and has to agree with
+  ## this on which mode produces which fields.
+  ##
+  ## A `vqNone` blob is viewed as `float32` even though Nim strings are only
+  ## byte-aligned - the kernels load unaligned (`loadu` under `-d:hnswSimd`, and a
+  ## plain float load otherwise, which this project only ever builds on x86-64).
+  ## The length check above is also what makes the first access safe: a valid
+  ## blob has at least one byte of payload.
+  if ix.dim <= 0 or blob.len != ix.bytesPerVector:
+    return
+  result.dim = ix.dim
+  case ix.params.quant
+  of vqNone:
+    result.floats = cast[ptr UncheckedArray[float32]](blob[0].unsafeAddr)
+  of vqInt8:
+    # The scale is the first four bytes, the codes follow. The blob is only
+    # byte-aligned, so the scale is copied rather than loaded through a cast.
+    copyMem(result.scale.addr, blob[0].unsafeAddr, sizeof(float32))
+    result.codes = cast[ptr UncheckedArray[int8]](blob[sizeof(float32)].unsafeAddr)
+  of vqInt8Fixed:
+    result.scale = ix.params.quantScale
+    result.codes = cast[ptr UncheckedArray[int8]](blob[0].unsafeAddr)
 
 func dotCacheF32(q, v: ptr UncheckedArray[float32], n: int): float32 {.inline.} =
   ## The float32 kernel on two raw buffers: `dot` is still the only
@@ -998,6 +1030,29 @@ func cacheSlot(ix: HnswIndex, id: int): int =
     -1
 
 
+proc storedBlob(ix: HnswIndex, id: int, blob: var string): bool =
+  ## Read `id`'s `^...NODE` value into `blob` and say whether the id has a vector
+  ## at all. This is the one database read for a stored vector: `loadVec` (which
+  ## unpacks it) and `distanceAt` (which views it) both go through here, so the
+  ## `absentIds` memo is written in exactly one place.
+  ##
+  ## `false` means the id is empty - deleted, never written, or already known to
+  ## be so. An empty read is remembered: `count` never hands an id out twice, so
+  ## an id that is empty stays empty, and what the memo saves is a YottaDB read
+  ## per stale reference in the hot path. Per index, never process-wide; see
+  ## `absentIds`.
+  ##
+  ## `blob` is left alone on the memo hit, so a caller must look at it only when
+  ## this returns true (the read overwrites it on the miss).
+  if id in ix.absentIds:
+    return false
+  blob = ydb_get(ix.params.globalNode, @[$id])
+  if blob.len == 0:
+    ix.absentIds.incl(id)
+    return false
+  true
+
+
 proc loadVec*(ix: HnswIndex, id: int): StoredVec =
   ## The vector of `id` as stored - from the in-process cache when there is one,
   ## otherwise one YottaDB read. In the quantized modes this never materializes
@@ -1029,20 +1084,18 @@ proc loadVec*(ix: HnswIndex, id: int): StoredVec =
     return
 
   # An id this index has already found empty - a deleted node reached through a
-  # one-way link. Memoised per index, so it cannot answer for another index's id
-  # space; see `absentIds`.
-  if id in ix.absentIds:
-    return
-  let s = ydb_get(ix.params.globalNode, @[$id])
-  if s.len == 0:
-    ix.absentIds.incl(id)
+  # one-way link - is skipped by `storedBlob`, which also owns the read. This
+  # proc is the *owning* decode: callers that only need a distance borrow the
+  # blob through `storedView` instead and never come here.
+  var blob: string
+  if not ix.storedBlob(id, blob):
     return
   case ix.params.quant
-  of vqNone: result.floats = unpackFloats(s)
-  of vqInt8: result = unpackQVec(s)
+  of vqNone: result.floats = unpackFloats(blob)
+  of vqInt8: result = unpackQVec(blob)
   of vqInt8Fixed:
     result.scale = ix.params.quantScale
-    result.codes = unpackInt8(s)
+    result.codes = unpackInt8(blob)
 
 proc vecViewAt(ix: HnswIndex, id: int, holder: var StoredVec): VecView =
   ## Borrowed view of `id`'s vector, for the paths that compare many vectors
@@ -1057,7 +1110,7 @@ proc vecViewAt(ix: HnswIndex, id: int, holder: var StoredVec): VecView =
   ##
   ## The decode is `loadVec`'s - same fields for the same mode, same scale - and a
   ## missing id yields a `dim == 0` view, which every distance treats as "no
-  ## vector", exactly as `isMissing` did.
+  ## vector", exactly as an empty `StoredVec` from `loadVec` did.
   let slot = ix.cacheSlot(id)
   if slot >= 0 and ix.cache.dim > 0:
     let base = slot * ix.cache.dim
@@ -1081,13 +1134,23 @@ proc distanceAt(ix: HnswIndex, q: VecView, id: int, dist: var float32): bool {.i
   ##
   ## The in-process cache is asked first, and a slot hit is the whole point of
   ## `VecView`: no `newSeqUninit`, no `copyMem`, no YottaDB call - the distance
-  ## runs on the arena's own bytes. Only an id the cache does not hold falls
-  ## through to `loadVec`, which is the three cases that need it: no cache at all,
+  ## runs on the arena's own bytes. Only an id the cache does not hold needs the
+  ## database, and those are the three cases `storedBlob` names: no cache at all,
   ## a vector another process wrote after we preloaded, and a deleted node (whose
   ## read comes back empty, which is how "missing" is recognised).
   ##
-  ## Returns false when the id has no vector, so a caller skips it exactly as it
-  ## did with `loadVec`'s `.isMissing`.
+  ## On that path the blob is *viewed* (`storedView`), not unpacked into a
+  ## `StoredVec`. The read is the same either way; what the view removes is the
+  ## allocation and the `copyMem` that used to turn the blob into a fresh seq for
+  ## one distance that was then discarded. The view borrows `blob`, which lives
+  ## until this proc returns - long enough for the distance and no longer, which
+  ## is exactly what a `VecView` may assume.
+  ##
+  ## Returns false when the id has no vector, and also when the blob is not one
+  ## this index's mode could have written (`storedView` then declines to decode
+  ## it). A candidate is skipped in both cases: comparing a mis-sized blob
+  ## against the query would only score it 1.0 through `dotView`'s length check,
+  ## which is worse than not offering it at all.
   ##
   ## This is the walk's per-candidate path, so the storage mode is not re-decided
   ## here. `q`'s form *is* the index's mode - `searchView` gets it from
@@ -1117,10 +1180,13 @@ proc distanceAt(ix: HnswIndex, q: VecView, id: int, dist: var float32): bool {.i
                cast[ptr UncheckedArray[float32]](ix.cache.floats[base].unsafeAddr),
                ix.cache.dim)
     return true
-  let ev = ix.loadVec(id)
-  if ev.isMissing:
+  var blob: string
+  if not ix.storedBlob(id, blob):
     return false
-  dist = distanceView(q, viewOf(ev))
+  let v = ix.storedView(blob)
+  if v.dim == 0:
+    return false
+  dist = distanceView(q, v)
   true
 
 when (defined(gcc) or defined(clang)) and not defined(hnswNoPrefetch):
@@ -2603,23 +2669,22 @@ proc searchInt8*(ix: HnswIndex, codes: openArray[int8], k = 5, ef = 0,
 
 proc blobView(ix: HnswIndex, blob: string): VecView =
   ## Validate a stored vector blob - a `^...NODE` value as it comes out of
-  ## YottaDB - and return a *view* of it, decoded the way `ix.params.quant` says
-  ## it was written. `loadVec` does the same decode for a neighbour, and the two
-  ## must not drift, or a query would be compared on a different grid than the
-  ## vectors it is compared against.
+  ## YottaDB - and return a *view* of it. The decode is `storedView`'s, the same
+  ## one `distanceAt` uses for a neighbour, so a query and the vectors it is
+  ## compared against cannot end up on different grids.
   ##
   ## No copy: `searchBlob` hands the blob straight to `searchView`, so the view
-  ## is used while the string is alive. A `vqNone` blob is viewed as `float32`
-  ## even though Nim strings are only byte-aligned - the kernels load unaligned
-  ## (`loadu` under `-d:hnswSimd`, and a plain float load otherwise, which this
-  ## project only ever builds on x86-64).
+  ## is used while the string is alive.
   ##
-  ## The length has to match the mode exactly. That check is the difference
-  ## between "your blob is the wrong thing" and a walk over 388 codes that the
-  ## 384-dim kernels are then happy to read past. A zero dimension is refused
-  ## outright: it is the one state where the expected length is 0 or 4 and the
-  ## blob cannot be viewed at all.
-  if ix.dim <= 0 or blob.len != ix.bytesPerVector:
+  ## What this adds over `storedView` is the *refusal*. The length has to match
+  ## the mode exactly, which is the difference between "your blob is the wrong
+  ## thing" and a walk over 388 codes that the 384-dim kernels are then happy to
+  ## read past. A zero dimension is refused outright: it is the one state where
+  ## the expected length is 0 or 4 and the blob cannot be viewed at all. A
+  ## candidate read by `distanceAt` gets no exception - it is skipped instead -
+  ## but a query blob comes from the caller, so raising is the right answer.
+  result = ix.storedView(blob)
+  if result.dim == 0:
     raise newException(ValueError,
       "query blob is " & $blob.len & " bytes, index expects " & $ix.bytesPerVector &
       " for " & $ix.params.quant & " at dim " & $ix.dim &
@@ -2627,18 +2692,6 @@ proc blobView(ix: HnswIndex, blob: string): VecView =
          "; the index records no dimension (" & ix.params.globalMeta &
          "(\"dim\") is missing or 0) and it could not be read off the stored blobs"
        else: ""))
-  result.dim = ix.dim
-  case ix.params.quant
-  of vqNone:
-    result.floats = cast[ptr UncheckedArray[float32]](blob[0].unsafeAddr)
-  of vqInt8:
-    # The scale is the first four bytes, the codes follow. The blob is only
-    # byte-aligned, so the scale is copied rather than loaded through a cast.
-    copyMem(result.scale.addr, blob[0].unsafeAddr, sizeof(float32))
-    result.codes = cast[ptr UncheckedArray[int8]](blob[sizeof(float32)].unsafeAddr)
-  of vqInt8Fixed:
-    result.scale = ix.params.quantScale
-    result.codes = cast[ptr UncheckedArray[int8]](blob[0].unsafeAddr)
 
 
 proc searchBlob*(ix: HnswIndex, blob: string, k = 5, ef = 0): seq[Hit] =
