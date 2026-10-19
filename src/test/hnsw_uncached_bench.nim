@@ -52,8 +52,7 @@
 
 import std/[math, monotimes, parseopt, random, strformat, strutils, times]
 import yottadb
-import ../hnsw
-import ../hnsw_options
+import ydbhnsw
 
 const
   Seed = 7
@@ -165,9 +164,10 @@ proc bench(cfg: Cfg, quant: VecQuant) =
   let global = "^HNSWUNCBENCH" & $quant
   let buildStart = getMonoTime()
   var ix = build(cfg, global, quant)
-  let built = (getMonoTime() - buildStart).inMilliseconds.float / 1000.0
+  let builtMs = (getMonoTime() - buildStart).inMilliseconds
   let blobs = ix.queryBlobs(cfg.queries)
-  info describe(ix, cfg) & &" (built in {built:.1f} s)"
+  info describe(ix, cfg) &
+       &" (built in {builtMs} ms, {builtMs / max(cfg.nodes, 1):.2f} ms/insert)"
   if blobs.len == 0:
     info "  no live vectors - nothing to measure"
     return

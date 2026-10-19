@@ -9,7 +9,7 @@
 ## Run: nim c -r -d:release -p:src src/test/hnsw_ydb_bench.nim
 
 import std/[math, random, strformat, strutils, times]
-import yottadb
+import ydbhnsw
 
 const
   Global = "^HNSWArticles"

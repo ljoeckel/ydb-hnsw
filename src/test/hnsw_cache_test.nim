@@ -18,8 +18,7 @@
 ## Run: nim c -r src/test/hnsw_cache_test.nim
 
 import std/[math, random, sequtils, strformat]
-import yottadb
-import ../hnsw
+import ydbhnsw
 
 const
   Dim = 64
@@ -83,7 +82,7 @@ proc params(quant: VecQuant, cacheVectors = false,
   ## YottaDB path and every comparison really is "mirrored against not".
   hnswParams(Scratch, M = 8, efConstruction = 64, efSearch = 32, seed = 99,
              dim = Dim, quant = quant, quantScale = Grid,
-             cacheVectors = cacheVectors, cacheLinks = cacheLinks)
+             cacheVectors = cacheVectors, preloadCacheVectors = cacheVectors, cacheLinks = cacheLinks, preloadCacheLinks = cacheLinks)
 
 proc searchAll(ix: HnswIndex, probes: seq[seq[float32]],
                ef = 32): seq[seq[(int, float32)]] =
@@ -115,6 +114,7 @@ when isMainModule:
 
     let plain = openHnsw(params(quant))          # no mirror at all: the reference
     let cached = openHnsw(hnswParams(Scratch, cacheVectors = true, cacheLinks = true))
+
     check(&"preloaded every vector ({cached.cachedVectors} of {cached.liveCount})",
           cached.cachedVectors == cached.liveCount)
     check("storage mode still comes from META", cached.params.quant == quant)

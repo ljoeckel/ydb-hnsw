@@ -1,8 +1,7 @@
 ## Scratch test for the deletion path: synthetic vectors, no Python, scratch
 ## globals ^HNSWTEST* so the real index is untouched.
 import std/[random, strformat]
-import yottadb
-import ../hnsw
+import ydbhnsw
 
 const Global = "^HNSWTEST"
 const Dim = 8

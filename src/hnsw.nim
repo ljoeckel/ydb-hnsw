@@ -1753,7 +1753,7 @@ func hnswParams*(global: string, model = DefaultModel,
                  M = 16, efConstruction = 200, efSearch = 64, seed = 1234,
                  dim = 0, quant = vqNone, quantScale = 0.0'f32,
                  linkFmt = lfUInt32,
-                 cacheVectors = true, cacheLinks = true,
+                 cacheVectors = true, preloadCacheVectors = true, cacheLinks = true, preloadCacheLinks = true,
                  batchSize = 128): HnswParams =
   ## Configure one index: `global` is the YottaDB global (`^HNSWxxx`) and the
   ## `NODE` / `KEY` / `META` names are derived from it, so no caller spells the
@@ -1773,6 +1773,7 @@ func hnswParams*(global: string, model = DefaultModel,
                       seed: seed, dim: dim, quant: quant, quantScale: quantScale,
                       linkFmt: linkFmt,
                       cacheVectors: cacheVectors, cacheLinks: cacheLinks,
+                      preloadCacheVectors: preloadCacheVectors, preloadCacheLinks: preloadCacheLinks,
                       batchSize: batchSize)
   deriveGlobalNames(result)
 
@@ -2130,8 +2131,7 @@ proc searchLayer(ix: HnswIndex, q: VecView, entryPoints: openArray[int],
   NeighborView(p: cast[ptr UncheckedArray[Neighbor]](ix.scratch.found[0].addr), n: n)
 
 proc selectNeighbors(ix: HnswIndex, candidates: seq[Neighbor], m: int,
-                     provided: openArray[VecView] = [],
-                     keepPruned = false): seq[int] =
+                     provided: openArray[VecView] = []): seq[int] =
   ## Malkov & Yashunin Algorithm 4, run on stored vectors. Candidates are
   ## accepted only when they are closer to the base vector than to every
   ## neighbour already accepted; this spreads the links in different directions
@@ -2154,6 +2154,10 @@ proc selectNeighbors(ix: HnswIndex, candidates: seq[Neighbor], m: int,
   ## Borrowing the bytes is safe for the same reason it is in `searchLayer`: this
   ## is a read-only pass, so nothing reaches `cacheReserve` / `setLen` while the
   ## views are in use.
+  ##
+  ## Returns at most `m` ids, and fewer when the heuristic rejects the rest: a
+  ## short list is the point of the heuristic, so there is no fill-back from the
+  ## rejected candidates. `putLinks` writes whatever length it gets.
   var order = newSeq[int](candidates.len)
   for i in 0 ..< order.len:
     order[i] = i
@@ -2173,7 +2177,6 @@ proc selectNeighbors(ix: HnswIndex, candidates: seq[Neighbor], m: int,
     owned = newSeq[StoredVec](order.len)
 
   var chosen: seq[int]
-  var pruned: seq[int]
   for i in 0 ..< order.len:
     if chosen.len >= m:
       break
@@ -2187,17 +2190,9 @@ proc selectNeighbors(ix: HnswIndex, candidates: seq[Neighbor], m: int,
         break
     if keep:
       chosen.add i
-    else:
-      pruned.add i
 
   for i in chosen:
     result.add candidates[order[i]].id
-  if keepPruned:
-    # Fill up with the discarded ones rather than returning fewer than `m`.
-    for i in pruned:
-      if result.len >= m:
-        break
-      result.add candidates[order[i]].id
 
 proc connect(ix: HnswIndex, id: int, vec: StoredVec, level: int, ep: var int) =
   ## Give `id` neighbours on one layer: search for candidates, pick them with the

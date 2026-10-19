@@ -12,8 +12,7 @@
 ## Run: nim c -r hnsw_quant_test
 
 import std/[algorithm, math, random, sequtils, strformat, times]
-import yottadb
-import ../hnsw
+import ydbhnsw
 
 const
   Dim = 384

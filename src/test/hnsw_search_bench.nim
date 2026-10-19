@@ -8,8 +8,7 @@
 ## Run: nim c -r -d:release -p:src src/test/hnsw_search_bench.nim [global] [queries] [cache]
 
 import std/[math, os, strformat, strutils, times]
-import ../hnsw
-import yottadb
+import ydbhnsw
 
 const
   DefaultGlobal = "^HNSWArticles"

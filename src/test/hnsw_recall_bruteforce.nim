@@ -85,8 +85,7 @@
 
 import std/[algorithm, os, random, sequtils, sets, strformat, strutils, tables, times]
 
-import yottadb
-import ../hnsw
+import ydbhnsw
 
 when defined(hnswSimd):
   # Same kernel family as `hnsw`; see the note there on why the parallelism is
