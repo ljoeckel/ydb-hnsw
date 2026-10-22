@@ -7,6 +7,7 @@ src/__pycache__/
 hnsw_search
 hnsw_articles
 hnsw_clean
+hnsw_service
 python/__pycache__/
 nimble.develop
 nimbledeps

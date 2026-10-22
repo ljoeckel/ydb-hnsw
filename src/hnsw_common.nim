@@ -1,4 +1,5 @@
-import std/[strutils, times, htmlparser, xmltree]
+import std/[strutils, times, xmltree]
+import pkg/htmlparser
 import ydbhnsw
 import rsstypes
 
@@ -130,11 +131,12 @@ proc getRssRef*(id: int): seq[string] =
         @[]
 
 proc getRssTitle*(subs: seq[string]): string = 
-    let title = Get ^RSSItem(subs, "title")
-    if title.len > 0:
-        return hnswNormalize(title)
-    else:
-        return ""
+    result = Get ^RSSItem(subs, "title")
+    #if result.len > 0:
+        #return hnswNormalize(title)
+    #    return title
+    #else:
+    #    return ""
 
 proc getRssTitle*(rssref: string): string = 
     if rssref.len > 0 and rssref.contains(","):
@@ -148,9 +150,10 @@ proc getRssTitle*(id: int): string =
 
 
 proc getRssDescription*(subs: seq[string]): string = 
-    let s = Get ^RSSItem(subs, "description")
-    let description = s.parseHtml().innerText
-    return hnswNormalize(description)
+    result = Get ^RSSItem(subs, "description")
+    return result.parseHtml().innerText
+    #let description = s.parseHtml().innerText
+    #return hnswNormalize(description)
 
 proc getRssDescription*(rssref: string): string = 
     if rssref.len > 0 and rssref.contains(","):

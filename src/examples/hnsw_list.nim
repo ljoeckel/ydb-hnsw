@@ -3,24 +3,32 @@ import ydbhnsw
 import hnsw_common       # getRssRef / getRssTitle / getRssDescription
 
 type AppOptions = object
-    bySequence: bool
-    byRandom: bool = true
-    verbose: bool
+    bySequence: bool = true
+    byRandom: bool = false
     k: int = 5
 
+var Usage = """
+usage: <program> [option=value]...
+
+  --[HnswOption]      Will be processed by HnswOption
+  --bySequence        Search from 0 .. n in ascending sequence (Default)
+  --byRandom          Search randomly
+"""
 
 const
     MinSim = 0.90'f32
 
 var cnt, notSelfCount, hitsCount, t100, totalTime = 0
+var ydbkey = initYdbKey("^HNSWArticlesNODE")
 
 proc nextItem(ix: HnswIndex, id: int, options: AppOptions ) =
-    let vs = ydb_get("^HNSWArticlesNODE", @[$id])
+    ydbkey.setSub(0, id)
+    let vs = ydb_get(ydbkey)
     let tx1 = getTime()
     let hits = ix.searchBlob(vs, k = options.k)
     let delta = (getTime() - tx1).inMicroseconds
 
-    if options.verbose:
+    if ix.params.verbose:
         echo &"{id:>8} {delta:>5} µs : {getRssTitle(id)}"
         for hit in hits:
             if hit.sim() > MinSim:
@@ -40,21 +48,26 @@ proc nextItem(ix: HnswIndex, id: int, options: AppOptions ) =
         t100 = 0
 
 
-proc inSequence(ix: HnswIndex, options: AppOptions) =
+proc inSequence(ix: HnswIndex, options: AppOptions, limit: int) =
+    var item = 0
     for subs in QueryItr ^HNSWArticlesNODE.keys:
         let id = parseInt(subs[0])
         nextItem(ix, id , options)
+        inc item
+        if item > limit: break
     echo fmt"cnt: {cnt}, hits: {hitsCount}, notSelfCount: {notSelfCount}"
 
 
-proc inRandom(ix: HnswIndex, options: AppOptions) =
+proc inRandom(ix: HnswIndex, options: AppOptions, limit: int) =
     var visited = HashSet[int]()
-
+    var item = 0
     for i in 0 .. ix.live:
         let id = rand(0 ..< ix.live)
         if not visited.contains(id):
             nextItem(ix, id, options)
             visited.incl(id)
+        inc item
+        if item > limit: break
     echo fmt"cnt: {cnt}, hits: {hitsCount}, notSelfCount: {notSelfCount}"
 
 proc getAppOptions(): AppOptions =
@@ -67,23 +80,21 @@ proc getAppOptions(): AppOptions =
         case toLowerAscii(key)
         of "bysequence": result.bySequence = true
         of "byrandom": result.byRandom = true   
-        of "verbose": result.verbose = true
-        of "k": result.k = parseInt(val)
-        else:
-            discard
+        of "help": echo Usage
+        else: discard
       else:
         discard
 
 when isMainModule:
+    let hnswParams = getHnswParams()
     let options = getAppOptions()
-    if options.verbose:
+    if hnswParams.verbose:
         echo "AppOptions: ", options
 
-    let hnswParams = getHnswParams()
     let ix = openHnsw(hnswParams)
 
-    if options.byRandom: inRandom(ix, options)
-    elif options.bySequence: inSequence(ix, options)
+    if options.byRandom: inRandom(ix, options, hnswParams.limit)
+    elif options.bySequence: inSequence(ix, options, hnswParams.limit)
     else:
         echo "Specifiy --byRandom or --bySequence"
     

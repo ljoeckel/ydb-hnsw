@@ -1,4 +1,4 @@
-import std/[parseopt, strutils, strformat]
+import std/[parseopt, strutils, strformat, os]
 
 
 const
@@ -130,12 +130,12 @@ proc parseBool(s: string): bool =
     of "f", "false": false
     else: false
 
-proc parseArgs(global: string, model: string): HNSWOptions =
+proc parseArgs(args: seq[string], global: string, model: string): HNSWOptions =
     result = HNSWOptions()
     result.index = global
     result.model = model
 
-    for kind, key, val in getopt():  
+    for kind, key, val in getopt(args):  
       case kind
       of cmdEnd: break
       of cmdShortOption, cmdLongOption:
@@ -189,8 +189,12 @@ proc parseArgs(global: string, model: string): HNSWOptions =
             quit &"{Usage}", 0
         of "verbose", "v":
             result.verbose = true
-        else: echo &"Unknown HnswOption key:{key} val:{val}. Ignored"            
+        else: echo &"Unknown HnswOption key:{key} val:{val}. Ignored"
       else: discard
+
+# proc parseArgs(global: string, model: string): HNSWOptions =
+#     ## The command line as the index tools have always read it.
+#     parseArgs(commandLineParams(), global, model)
 
 
 proc deriveGlobalNames(p: var HnswParams) =
@@ -205,8 +209,12 @@ proc deriveGlobalNames(p: var HnswParams) =
     p.globalQueue = p.global & "QUEUE"
 
 
-proc getHnswParams*(global: string = DefaultIndex, model: string = DefaultModel): HnswParams =
-    let options = parseArgs(global, model)
+proc getHnswParams*(global: string = DefaultIndex, model: string = DefaultModel,
+                    args: seq[string] = commandLineParams()): HnswParams =
+    ## `args` is the index's argument list. It defaults to the process command
+    ## line; a host that has options of its own (the HTTP service's `--port`)
+    ## passes the arguments that are meant for the index instead.
+    let options = parseArgs(args, global, model)
     result = HnswParams()
     result.global = options.index
     deriveGlobalNames(result)

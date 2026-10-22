@@ -3,6 +3,13 @@ when withDir(thisDir(), system.fileExists("nimble.paths")):
   include "nimble.paths"
 # end Nimble config
 
+# --- HTTP service (mummyDS) ---------------------------------------------------
+# Mummy dispatches requests to worker threads and checks for threads at compile
+# time; the flag can only be given here or on the command line, not from inside a
+# module. ORC (which Mummy also requires) is Nim 2's default. Harmless for the
+# index tools: they already use threadvars and are safe to build with threads on.
+switch("threads", "on")
+
 # --- hnsw.nim distance kernels -----------------------------------------------
 # `dot`, `dotInt8` and `normalize` use the nimsimd intrinsics; -mavx is what lets
 # the C compiler accept them. Build with `-d:hnswNoSimd` (or delete these three

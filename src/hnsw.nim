@@ -364,6 +364,9 @@ type
                             ## goes to YottaDB
     scratch: SearchScratch  ## buffers `searchLayer` reuses; see `SearchScratch`
 
+var GLOBALNODE, GLOBALLINKS, GLOBALLEVEL, GLOBALKEY, GLOBALMETA {.threadvar}: YdbKey
+
+
 func heapPush(h: var HnswHeap, dist: float32, id: int) {.inline.} =
   ## Add `(dist, id)` to the min-heap `h`.
   ##
@@ -1046,7 +1049,8 @@ proc storedBlob(ix: HnswIndex, id: int, blob: var string): bool =
   ## this returns true (the read overwrites it on the miss).
   if id in ix.absentIds:
     return false
-  blob = ydb_get(ix.params.globalNode, @[$id])
+  GLOBALNODE.setSub(0, id)
+  blob = ydb_get(GLOBALNODE)
   if blob.len == 0:
     ix.absentIds.incl(id)
     return false
@@ -1225,21 +1229,26 @@ when PrefetchEnabled:
 # ---------------------------------------------------------------------------
 
 proc putLevel(ix: HnswIndex, id, level: int) =
-  ydb_set(ix.params.globalLevel, @[$id], $level)
+  GLOBALLEVEL.setSub(0, id)
+  ydb_set(GLOBALLEVEL, $level)
 
 proc getLevel(ix: HnswIndex, id: int): int =
-  let s = ydb_get(ix.params.globalLevel, @[$id])
+  GLOBALLEVEL.setSub(0, id)
+  let s = ydb_get(GLOBALLEVEL)
   if s.len == 0: 0 else: parseInt(s)
 
 
 proc putKey(ix: HnswIndex, key: string, id: int) =
   if key.len > 0:
-    ydb_set(ix.params.globalKey, @[key], $id)
-    ydb_set(ix.params.globalKey, @[$id], key) # inverted
+    GLOBALKEY.setSub(0, key)
+    ydb_set(GLOBALKEY, $id)
+    GLOBALKEY.setSub(0, id)
+    ydb_set(GLOBALKEY, $key)
 
 proc lookup*(ix: HnswIndex, key: string): int =
   ## Node id stored for `key`, or -1 if that key was never indexed.
-  let s = ydb_get(ix.params.globalKey, @[key])
+  GLOBALKEY.setSub(0, key)
+  let s = ydb_get(GLOBALKEY)
   if s.len == 0: -1 else: parseInt(s)
 
 # ---------------------------------------------------------------------------
@@ -1357,12 +1366,15 @@ func linksForgetAll(ix: HnswIndex, id: int) =
 
 proc ydbLinks(ix: HnswIndex, id, level: int): seq[int] =
   ## One neighbour list straight from YottaDB - the read the mirror saves.
-  unpackLinks(ix.params.linkFmt, ydb_get(ix.params.globalLinks, @[$id, $level]))
+  GLOBALLINKS.setSub(0, id)
+  GLOBALLINKS.setSub(1, level)
+  unpackLinks(ix.params.linkFmt, ydb_get(GLOBALLINKS))
 
 proc putLinks(ix: HnswIndex, id, level: int, links: openArray[int]) =
   if links.len > 0:
-    ydb_set(ix.params.globalLinks, @[$id, $level],
-            packLinks(ix.params.linkFmt, links))
+    GLOBALLINKS.setSub(0, id)
+    GLOBALLINKS.setSub(1, level)
+    ydb_set(GLOBALLINKS, packLinks(ix.params.linkFmt, links))
     ix.linksStore(id, level, links)
 
 proc linksAt(ix: HnswIndex, id, level: int,
@@ -1419,19 +1431,23 @@ func refreshLinks*(ix: HnswIndex) =
   ix.links = LinkStore()
 
 proc metaSet(ix: HnswIndex, key, value: string) =
-  ydb_set(ix.params.globalMeta, @[key], value)
+  GLOBALMETA.setSub(0, key)
+  ydb_set(GLOBALMETA, value)
 
 proc metaGet(ix: HnswIndex, key: string, default: int): int =
-  let s = ydb_get(ix.params.globalMeta, @[key])
+  GLOBALMETA.setSub(0, key)
+  let s = ydb_get(GLOBALMETA)
   if s.len == 0: default else: parseInt(s)
 
 proc metaGetFloat(ix: HnswIndex, key: string, default: float32): float32 =
-  let s = ydb_get(ix.params.globalMeta, @[key])
+  GLOBALMETA.setSub(0, key)
+  let s = ydb_get(GLOBALMETA)
   if s.len == 0: default else: float32(parseFloat(s))
 
 proc metaGetName(ix: HnswIndex, key, default: string): string =
   ## Text META value (`quant`), with a default for keys an older index lacks.
-  let s = ydb_get(ix.params.globalMeta, @[key])
+  GLOBALMETA.setSub(0, key)
+  let s = ydb_get(GLOBALMETA)
   if s.len == 0: default else: s
 
 proc bumpLive(ix: HnswIndex, delta: int) =
@@ -1449,9 +1465,10 @@ proc bumpLive(ix: HnswIndex, delta: int) =
   ## An index built before `live` existed has no META key, and `$INCREMENT` on a
   ## missing node starts from 0 - so seed it from what `openHnsw` worked out
   ## (`live` == `count` in that case) before the first bump.
-  if ydb_data(ix.params.globalMeta, @["live"]) == 0:
+  GLOBALMETA.setSub(0, "live")
+  if ydb_data(GLOBALMETA) == 0:
     ix.metaSet("live", $ix.live)
-  ix.live = ydb_increment(ix.params.globalMeta, @["live"], delta)
+  ix.live = ydb_increment(GLOBALMETA, delta)
 
 func maxLinks*(ix: HnswIndex, level: int): int =
   ## Level 0 keeps twice as many links - that is where the whole graph gets
@@ -1604,7 +1621,8 @@ proc cacheVector(ix: HnswIndex, id: int): bool =
     ix.cacheIds(id + 1)
   if ix.cache.idToSlot[id] >= 0:
     return false
-  let s = ydb_get(ix.params.globalNode, @[$id])
+  GLOBALNODE.setSub(0, id)
+  let s = ydb_get(GLOBALNODE)
   if s.len == 0:
     return false
   # Validate the blob against the mode before committing a slot, so a malformed
@@ -1645,7 +1663,9 @@ proc preloadLinks(ix: HnswIndex): int =
     for keys in QueryItr @gbl.keys:
         let id = parseInt(keys[0])
         let level = parseInt(keys[1])
-        let links = unpackLinks(ix.params.linkFmt, ydb_get(ix.params.globalLinks, @[$id, $level]))
+        GLOBALLINKS.setSub(0, id)
+        GLOBALLINKS.setSub(1, level)
+        let links = unpackLinks(ix.params.linkFmt, ydb_get(GLOBALLINKS))
         ix.linksStore(id, level, links)
         inc result
 
@@ -1703,13 +1723,14 @@ proc putVec(ix: HnswIndex, id: int, v: StoredVec) =
   ## YottaDB first, then the mirror - never the other way round, so an
   ## interrupted write can only leave the cache behind, not ahead of the
   ## database.
+  GLOBALNODE.setSub(0, id)
   case ix.params.quant
   of vqNone:
-    ydb_set(ix.params.globalNode, @[$id], packFloats(v.floats))
+    ydb_set(GLOBALNODE, packFloats(v.floats))
   of vqInt8:
-    ydb_set(ix.params.globalNode, @[$id], packQVec(v.scale, v.codes))
+    ydb_set(GLOBALNODE, packQVec(v.scale, v.codes))
   of vqInt8Fixed:
-    ydb_set(ix.params.globalNode, @[$id], packInt8(v.codes))
+    ydb_set(GLOBALNODE, packInt8(v.codes))
   
   ix.cachePut(id, v)
 
@@ -1738,7 +1759,7 @@ proc setModelLoader*(loader: ModelLoader) =
   ## `ModelLoader`. `bert_nim.loadModel` is what the embedding side registers.
   modelLoader = loader
 
-func deriveGlobalNames(p: var HnswParams) =
+proc deriveGlobalNames(p: var HnswParams) =
   ## Fill in the `^...NODE` / `^...KEY` / `^...META` names that belong to
   ## `p.global`, unless a caller named them itself.
   if p.globalNode.len == 0:
@@ -1749,7 +1770,7 @@ func deriveGlobalNames(p: var HnswParams) =
     p.globalMeta = p.global & "META"
     p.globalQueue = p.global & "QUEUE"
 
-func hnswParams*(global: string, model = DefaultModel,
+proc hnswParams*(global: string, model = DefaultModel,
                  M = 16, efConstruction = 200, efSearch = 64, seed = 1234,
                  dim = 0, quant = vqNone, quantScale = 0.0'f32,
                  linkFmt = lfUInt32,
@@ -1818,7 +1839,8 @@ proc inferDim(ix: HnswIndex): int =
     return 0
   var lens: seq[int]
   for id in 0 ..< min(ix.count, 64):
-    let s = ydb_get(ix.params.globalNode, @[$id])
+    GLOBALNODE.setSub(0, id)
+    let s = ydb_get(GLOBALNODE)
     if s.len > 0:
       lens.add s.len        # a hole is a reserved-but-unwritten or deleted id
   if lens.len < 2:
@@ -1842,6 +1864,24 @@ proc inferDim(ix: HnswIndex): int =
     if want > sizeof(float32): want - sizeof(float32) else: 0
   of vqInt8Fixed:
     want
+
+proc bindGlobals*(ix: HnswIndex) =
+  ## Point this thread's YottaDB keys at `ix`'s globals.
+  ##
+  ## The keys are `{.threadvar.}`s - a `YdbKey` owns buffers and cannot be shared
+  ## between threads - but only `openHnsw` binds them, and only for the thread
+  ## that opened the index. A host that uses one index from several threads (the
+  ## HTTP service in `hnsw_service.nim` does) has to call this on each of them
+  ## first; without it the first operation there reaches YottaDB with an empty
+  ## global name and fails with %YDB-E-INVVARNAME.
+  ##
+  ## Cheap enough to call per request: four buffer allocations and a name copy.
+  ## Calling it again for the same index is harmless, it just rebinds.
+  GLOBALNODE = initYdbKey(ix.params.globalNode)
+  GLOBALLINKS = initYdbKey(ix.params.globalLinks)
+  GLOBALLEVEL = initYdbKey(ix.params.globalLevel)
+  GLOBALKEY = initYdbKey(ix.params.globalKey)
+  GLOBALMETA = initYdbKey(ix.params.globalMeta)
 
 proc openHnsw*(p: HnswParams): HnswIndex =
   ## Open (or create) the index described by `p` - the single way in, whether the
@@ -1876,6 +1916,9 @@ proc openHnsw*(p: HnswParams): HnswIndex =
   # %YDB-E-INVVARNAME, depending on what ran before. Neither is what the contract
   # above promises.
   deriveGlobalNames(result.params)
+
+  result.bindGlobals()
+
   result.rng = initRand(result.params.seed)
   result.entry = -1
   result.absentIds = initHashSet[int]()
@@ -1963,18 +2006,24 @@ proc openHnsw*(p: HnswParams): HnswIndex =
     discard result.preloadLinks()
   
 
-  let gbl = result.params.globalMeta
   let p = result.params
-  if ydb_data(gbl, @["M"]) == 0:  # initialize only once
-    ydb_set(gbl, @["M"], $p.M)
-    ydb_set(gbl, @["efConstruction"], $p.efConstruction)
-    ydb_set(gbl, @["dim"], $p.dim)
-    ydb_set(gbl, @["quant"], $p.quant)
+  GLOBALMETA.setSub(0, "M")
+  if ydb_data(GLOBALMETA) == 0:  # initialize only once
+    ydb_set(GLOBALMETA, $p.M)
+    GLOBALMETA.setSub(0, "efConstruction")
+    ydb_set(GLOBALMETA, $p.efConstruction)
+    GLOBALMETA.setSub(0, "dim")
+    ydb_set(GLOBALMETA, $p.dim)
+    GLOBALMETA.setSub(0, "quant")
+    ydb_set(GLOBALMETA, $p.quant)
     if p.quant == vqInt8Fixed:
-        ydb_set(gbl, @["qscale"], $p.quantScale)
-    ydb_set(gbl, @["linkfmt"], $p.linkFmt)    
+        GLOBALMETA.setSub(0, "qscale")
+        ydb_set(GLOBALMETA, $p.quantScale)
+    GLOBALMETA.setSub(0, "linkfmt")
+    ydb_set(GLOBALMETA, $p.linkFmt)    
     if p.model.len > 0:
-        ydb_set(gbl, @["model"], p.model)    
+        GLOBALMETA.setSub(0, "model")
+        ydb_set(GLOBALMETA, p.model)    
 
 
 
@@ -2001,7 +2050,8 @@ proc hasId*(ix: HnswIndex, id: int): bool =
   ## and no call at all once `preloadVectors` has made the cache complete.
   if ix.cache.complete and id >= 0 and id < ix.cache.idToSlot.len:
     return ix.cache.idToSlot[id] >= 0
-  ydb_data(ix.params.globalNode, @[$id]) != 0
+  GLOBALNODE.setSub(0, id)
+  ydb_data(GLOBALNODE) != 0
 
 func liveCount*(ix: HnswIndex): int =
   ## Number of nodes actually in the graph (`ix.count` is the id high-water
@@ -2011,11 +2061,12 @@ func liveCount*(ix: HnswIndex): int =
 proc nodeCount*(global: string): int =
   ## Number of nodes straight from YottaDB, without building an index object.
   ## Reads the META global, so it works for any index name.
-  let meta = global & "META"
-  let live = ydb_get(meta, @["live"])
+  GLOBALMETA.setSub(0, "live")
+  let live = ydb_get(GLOBALMETA)
   if live.len > 0:
     return parseInt(live)
-  let allocated = ydb_get(meta, @["count"])
+  GLOBALMETA.setSub(0, "count")
+  let allocated = ydb_get(GLOBALMETA)
   if allocated.len == 0: 0 else: parseInt(allocated)
 
 
@@ -2258,7 +2309,8 @@ proc add*(ix: HnswIndex, vec: openArray[float32], key = ""): int =
   ## id", so the id we own is the incremented value minus one; `ix.count` is then
   ## pulled up to it so the rest of this call sees a coherent id space.
   let lastCount = ix.count
-  let id = ydb_increment(ix.params.globalMeta, @["count"]) - 1
+  GLOBALMETA.setSub(0, "count")
+  let id = ydb_increment(GLOBALMETA) - 1
   if id + 1 > ix.count:
     ix.count = id + 1
   if id > lastCount and ix.params.cacheVectors:
@@ -2422,7 +2474,9 @@ proc unlink(ix: HnswIndex, id: int): seq[(int, int)] =
       if kept.len == nLinks.len:
         continue                      # link was already pruned one-way
       if kept.len == 0:
-        ydb_delete(ix.params.globalLinks, @[$n, $l], YDB_DEL_NODE)
+        GLOBALLINKS.setSub(0, n)
+        GLOBALLINKS.setSub(1, l)
+        ydb_delete(GLOBALLINKS, YDB_DEL_NODE)
         ix.linksForget(n, l)
         result.add (n, l)
       else:
@@ -2468,15 +2522,19 @@ proc delete*(ix: HnswIndex, id: int): bool =
   # Both directions of the key index. The `lookup(key) == id` guard matters
   # because forward and inverted mappings share one global: a key that happens
   # to look like an id must not delete somebody else's entry.
-  let key = ydb_get(ix.params.globalKey, @[$id])
-  ydb_delete(ix.params.globalKey, @[$id], YDB_DEL_NODE)
+  GLOBALKEY.setSub(0, id)
+  let key = ydb_get(GLOBALKEY)
+  ydb_delete(GLOBALKEY, YDB_DEL_NODE)
   if key.len > 0 and ix.lookup(key) == id:
-    ydb_delete(ix.params.globalKey, @[key], YDB_DEL_NODE)
-
-  ydb_delete(ix.params.globalLevel, @[$id], YDB_DEL_NODE)
-  ydb_delete(ix.params.globalLinks, @[$id], YDB_DEL_TREE)
+    GLOBALKEY.setSub(0, key)
+    ydb_delete(GLOBALKEY, YDB_DEL_NODE)
+  GLOBALLEVEL.setSub(0, id)
+  ydb_delete(GLOBALLEVEL, YDB_DEL_NODE)
+  GLOBALLINKS.setSub(0, id)
+  ydb_delete(GLOBALLINKS, YDB_DEL_TREE)
   ix.linksForgetAll(id)
-  ydb_delete(ix.params.globalNode, @[$id], YDB_DEL_NODE)
+  GLOBALNODE.setSub(0, id)
+  ydb_delete(GLOBALNODE, YDB_DEL_NODE)
 
   # The id is gone from the cache too. The store is dense, so this leaves no hole
   # behind: the slot goes back and the next `cachePut` reuses it. Recording the id
@@ -2720,7 +2778,8 @@ proc levelsSummary*(ix: HnswIndex): string =
   ## are holes in the id space, not level-0 nodes.
   var perLevel: seq[int]
   for id in 0 ..< ix.count:
-    let s = ydb_get(ix.params.globalLevel, @[$id])
+    GLOBALLEVEL.setSub(0, id)
+    let s = ydb_get(GLOBALLEVEL)
     if s.len == 0:
       continue
     let lv = parseInt(s)
