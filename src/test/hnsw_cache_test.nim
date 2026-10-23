@@ -30,7 +30,8 @@ const
 
 proc resetIndex(global: string) =
   for g in [global & "NODE", global & "KEY", global & "META", global & "LINKS", global & "LEVEL"]:
-    ydb_delete(g, @[], YDB_DEL_TREE)
+    var key = initYdbKey(g)          # no subscripts: the whole tree
+    ydb_delete(key, YDB_DEL_TREE)
 
 proc writeLinksRaw(ix: HnswIndex, id, layer: int, links: seq[int]) =
   ## A neighbour list written straight into `^...LINKS`, the way another process
@@ -40,7 +41,8 @@ proc writeLinksRaw(ix: HnswIndex, id, layer: int, links: seq[int]) =
   let dst = cast[ptr UncheckedArray[uint32]](blob[0].addr)
   for i, x in links:
     dst[i] = uint32(x)
-  ydb_set(ix.params.globalLinks, @[$id, $layer], blob)
+  var key = initYdbKey(ix.params.globalLinks, $id, $layer)
+  ydb_set(key, blob)
 
 proc randomVecs(n: int, rng: var Rand): seq[seq[float32]] =
   for i in 0 ..< n:

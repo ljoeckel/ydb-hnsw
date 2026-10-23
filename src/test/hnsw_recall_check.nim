@@ -55,7 +55,8 @@ proc queryVec(ix: HnswIndex, id: int): seq[float32] =
   ## under it. Empty for an id without a vector, or with a blob that does not
   ## decode to the index's dimension - `search` asserts on that dimension, so an
   ## odd entry must not reach it.
-  let s = ydb_get(ix.params.globalNode, @[$id])
+  var key = initYdbKey(ix.params.globalNode, $id)
+  let s = ydb_get(key)
   if s.len == 0:
     return
   case ix.params.quant

@@ -118,7 +118,8 @@ proc resetIndex(p: HnswParams) =
   ## the previous one.
   for g in [p.globalNode, p.globalKey, p.globalMeta, p.globalLinks,
             p.globalLevel, p.globalQueue]:
-    ydb_delete(g, @[], YDB_DEL_TREE)
+    var key = initYdbKey(g)          # no subscripts: the whole tree
+    ydb_delete(key, YDB_DEL_TREE)
 
 proc randomVec(rng: var Rand, dim: int): seq[float32] =
   result = newSeq[float32](dim)
@@ -150,7 +151,8 @@ proc queryBlobs(ix: HnswIndex, want: int): seq[string] =
   var id = 0
   while id < ix.count and result.len < want:
     if ix.hasId(id):
-      let b = ydb_get(ix.params.globalNode, @[$id])
+      var key = initYdbKey(ix.params.globalNode, $id)
+      let b = ydb_get(key)
       if b.len > 0:
         result.add b
     inc id
@@ -200,7 +202,8 @@ proc dump(cfg: Cfg, quant: VecQuant) =
   for id in 0 ..< min(cfg.nodes, ix.count):
     if not ix.hasId(id):
       continue
-    let b = ydb_get(ix.params.globalNode, @[$id])
+    var key = initYdbKey(ix.params.globalNode, $id)
+    let b = ydb_get(key)
     if b.len == 0:
       continue
     var line = $quant & " q=" & $id & ":"
@@ -226,7 +229,8 @@ proc dumpStale(cfg: Cfg) =
   for id in 0 ..< min(cfg.nodes, writer.count):
     if not reader.hasId(id):
       continue
-    let b = ydb_get(reader.params.globalNode, @[$id])
+    var key = initYdbKey(reader.params.globalNode, $id)
+    let b = ydb_get(key)
     if b.len == 0:
       continue
     var line = "staleCache q=" & $id & ":"

@@ -256,7 +256,8 @@ proc storedVec(ix: HnswIndex, store: string, id: int): seq[float32] =
   ## and the same dequantization `hnsw.loadVec` does. Empty when there is no such
   ## node (the empty string is 0 dimensions, not a zero vector) or when what is
   ## there does not decode to the index's dimension.
-  let s = ydb_get(store, @[$id])
+  var key = initYdbKey(store, $id)
+  let s = ydb_get(key)
   if s.len == 0: return
   case ix.params.quant
   of vqNone: result = unpackFloats(s)
@@ -281,7 +282,8 @@ proc keyOf(ix: HnswIndex, id: int): string =
   ## The key the index filed `id` under, for reading a report line - the idxref of
   ## the article, on the article index. One small read, and only the verbose
   ## report asks for it.
-  ydb_get(ix.params.globalKey, @[$id])
+  var key = initYdbKey(ix.params.globalKey, $id)
+  ydb_get(key)
 
 const SimNone = -2.0'f32
   ## Sentinel for "no similarity available": an id without a usable vector. Never
@@ -315,22 +317,23 @@ proc storeIds(store: string): tuple[ids: seq[int], nodes, ignored: int] =
   ## No value is read here: whether a node really carries a vector of this index's
   ## dimension is decided by the scan (and by `search`), which reads every one of
   ## them anyway.
-  var subs: Subscripts = @[]
-  var rc: int
-  (rc, subs) = ydb_node_next(store, subs)
+  var key = initYdbKey(store)
+  var rc = ydb_node_next(key)
   while rc == YDB_OK:
     inc result.nodes
     var id = -1
-    if subs.len == 1 and subs[0].allCharsInSet({'0' .. '9'}):
-      try:
-        id = parseInt(subs[0])
-      except ValueError:
-        id = -1                   # absurdly long - not an id this index has
+    if key.subCount == 1:
+      let sub = key.subscript(0)
+      if sub.allCharsInSet({'0' .. '9'}):
+        try:
+          id = parseInt(sub)
+        except ValueError:
+          id = -1                 # absurdly long - not an id this index has
     if id < 0:
       inc result.ignored
     else:
       result.ids.add id
-    (rc, subs) = ydb_node_next(store, subs)
+    rc = ydb_node_next(key)
   result.ids.sort()
 
 proc sampleIndices(n, count, seed: int): seq[int] =

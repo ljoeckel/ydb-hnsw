@@ -24,7 +24,8 @@ proc selfRetrievalOk(ix: HnswIndex, vecs: seq[seq[float32]]): bool =
 # helpers below speak int64 - which is why `params` pins `linkFmt = lfInt`
 # instead of taking the default.
 proc readLinks(ix: HnswIndex, id, layer: int): seq[int] =
-  let s = ydb_get(ix.params.globalLinks, @[$id, $layer])
+  var key = initYdbKey(ix.params.globalLinks, $id, $layer)
+  let s = ydb_get(key)
   let n = s.len div sizeof(int64)
   result = newSeq[int](n)
   if n > 0:
@@ -33,14 +34,15 @@ proc readLinks(ix: HnswIndex, id, layer: int): seq[int] =
       result[i] = int(src[i])
 
 proc writeLinks(ix: HnswIndex, id, layer: int, links: seq[int]) =
+  var key = initYdbKey(ix.params.globalLinks, $id, $layer)
   if links.len == 0:
-    ydb_delete(ix.params.globalLinks, @[$id, $layer], YDB_DEL_NODE)
+    ydb_delete(key, YDB_DEL_NODE)
   else:
     var blob = newString(links.len * sizeof(int64))
     let dst = cast[ptr UncheckedArray[int64]](blob[0].addr)
     for i, x in links:
       dst[i] = int64(x)
-    ydb_set(ix.params.globalLinks, @[$id, $layer], blob)
+    ydb_set(key, blob)
 
 proc resetIndex(params: HnswParams) =
   ## Every tree the index owns - not just the three `add` writes. `LINKS` and
@@ -48,7 +50,8 @@ proc resetIndex(params: HnswParams) =
   ## puts a freshly added node on a layer whose link list was never written.
   for g in [params.globalNode, params.globalKey, params.globalMeta,
             params.globalLinks, params.globalLevel]:
-    ydb_delete(g, @[], YDB_DEL_TREE)
+    var key = initYdbKey(g)          # no subscripts: the whole tree
+    ydb_delete(key, YDB_DEL_TREE)
 
 when isMainModule:
   # The scratch index this test works on, configured once: `hnswParams` derives
@@ -88,7 +91,8 @@ when isMainModule:
   let victim = 21
   # A node's own list is the only index of who it points at, so dropping its
   # whole per-node tree strands it on every layer at once.
-  ydb_delete(params.globalLinks, @[$victim], YDB_DEL_TREE)
+  var victimKey = initYdbKey(params.globalLinks, $victim)
+  ydb_delete(victimKey, YDB_DEL_TREE)
   echo &"stripped node {victim}: L0 links now {readLinks(ix, victim, 0).len}"
   echo "self-retrieval while stranded  : ", selfRetrievalOk(ix, vecs)
   echo "repair() re-linked layers      : ", ix.repair()
@@ -123,7 +127,8 @@ when isMainModule:
   # --- stale bookkeeping: point META at a deleted node and reopen ------------
   # This is the "search suddenly returns nothing" failure a crashed or
   # interrupted delete can leave behind.
-  ydb_set(params.globalMeta, @["entry"], "2")        # 2 was deleted above
+  var entryKey = initYdbKey(params.globalMeta, "entry")
+  ydb_set(entryKey, "2")            # 2 was deleted above
   var ix2 = openHnsw(params)
   echo &"reopened with entry={ix2.entry} (deleted): search -> ",
        ix2.search(vecs[1], k = 1).len, " hits"

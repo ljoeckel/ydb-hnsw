@@ -24,7 +24,8 @@ proc queryVec(ix: HnswIndex, id: int): seq[float32] =
   ## `id`'s stored vector as float32. For a quantized index this dequantizes,
   ## which is fine for a benchmark query - the point is a realistic vector, not
   ## bit-exactness with what `search` then re-quantizes.
-  let s = ydb_get(ix.params.globalNode, @[$id])
+  var key = initYdbKey(ix.params.globalNode, $id)
+  let s = ydb_get(key)
   case ix.params.quant
   of vqNone:
     unpackFloats(s)

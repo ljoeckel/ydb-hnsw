@@ -60,7 +60,8 @@ proc storedVecs(n: int): seq[seq[float32]] =
     return
   for k in 0 ..< n:
     let id = k * count div n
-    let s = ydb_get(Global & "NODE", @[$id, "vec"])
+    var key = initYdbKey(Global & "NODE", $id, "vec")
+    let s = ydb_get(key)
     if s.len == Dim * sizeof(float32):
       result.add unpackFloats(s)
 
@@ -132,12 +133,15 @@ proc rankOverlap(tag: string, vecs: seq[seq[float32]], codes: seq[seq[int8]],
 
 proc resetIndex(global: string) =
   for g in [global & "NODE", global & "KEY", global & "META"]:
-    ydb_delete(g, @[], YDB_DEL_TREE)
+    var key = initYdbKey(g)          # no subscripts: the whole tree
+    ydb_delete(key, YDB_DEL_TREE)
 
 proc vecBytes(ix: HnswIndex): int =
   ## Bytes of vector payload actually on disk, summed over the nodes.
+  var key = initYdbKey(ix.params.globalNode, "", "vec")
   for id in 0 ..< ix.count:
-    result += ydb_get(ix.params.globalNode, @[$id, "vec"]).len
+    key.setSub(0, id)
+    result += ydb_get(key).len
 
 proc exactTop(vecs: seq[seq[float32]], qi, k: int): seq[int] =
   ## Brute-force nearest neighbours of `vecs[qi]`, the query's own node excluded.

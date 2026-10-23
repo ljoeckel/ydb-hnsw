@@ -2800,5 +2800,7 @@ proc levelsSummary*(ix: HnswIndex): string =
 
 proc dropIndex*(params: HnswParams) =
     for gbl in [params.globalNode, params.globalKey, params.globalMeta, params.globalLevel, params.globalKey, params.globalLinks, params.globalQueue]:
-        ydb_delete(gbl, @[], YDB_DEL_TREE)
+        if gbl.len == 0: continue
+        var key = initYdbKey(gbl)      # no subscripts: the whole tree
+        ydb_delete(key, YDB_DEL_TREE)
         echo gbl, " deleted"

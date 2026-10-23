@@ -44,37 +44,49 @@ proc timeIt(tag: string, body: proc()) =
 proc main() =
   let meta = Global & "META"
   let node = Global & "NODE"
-  let countS = ydb_get(meta, @["count"])
+  var metaKey = initYdbKey(meta, "count")
+  let countS = ydb_get(metaKey)
   if countS.len == 0:
     echo "no index in " & Global
     return
   let count = parseInt(countS)
   echo &"{Global}: count={count}"
 
+  # One key per shape, reused with `setSub` - that is what the allocation-free
+  # `YdbKey` API exists for, and it keeps the timings about YottaDB, not about
+  # building subscript strings.
+  var vecKey = initYdbKey(node, "", "vec")
+  var linksKey = initYdbKey(node, "", "links", "0")
+
   # A set of live ids, plus one vector to dot against.
   var ids: seq[int]
   var rng = initRand(7)
   while ids.len < 5000:
     let id = rand(rng, count - 1)
-    if ydb_data(node, @[$id, "vec"]) != 0:
+    vecKey.setSub(0, id)
+    if ydb_data(vecKey) != 0:
       ids.add id
-  let q = unpackFloats(ydb_get(node, @[$ids[0], "vec"]))
+  vecKey.setSub(0, ids[0])
+  let q = unpackFloats(ydb_get(vecKey))
   echo &"  query dim {q.len}, blob {q.len * 4} bytes"
 
   var i = 0
   timeIt("ydb_get(vec) + unpack", proc() =
     for _ in 0 ..< Ops:
-      let v = unpackFloats(ydb_get(node, @[$ids[i mod ids.len], "vec"]))
+      vecKey.setSub(0, ids[i mod ids.len])
+      let v = unpackFloats(ydb_get(vecKey))
       sink += v[0]
       inc i)
   timeIt("ydb_get(links) + unpackInts", proc() =
     for _ in 0 ..< Ops:
-      let l = unpackLinks(ydb_get(node, @[$ids[i mod ids.len], "links", "0"]))
+      linksKey.setSub(0, ids[i mod ids.len])
+      let l = unpackLinks(ydb_get(linksKey))
       sink += float64(l.len)
       inc i)
   timeIt("ydb_data(vec)", proc() =
     for _ in 0 ..< Ops:
-      sink += float64(ydb_data(node, @[$ids[i mod ids.len], "vec"]))
+      vecKey.setSub(0, ids[i mod ids.len])
+      sink += float64(ydb_data(vecKey))
       inc i)
   timeIt("scalar dot (384d)", proc() =
     for _ in 0 ..< Ops:
