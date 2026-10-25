@@ -22,17 +22,20 @@
 ##
 ## Threading: Mummy dispatches handlers to worker threads, but an `HnswIndex`
 ## keeps scratch buffers and caches per instance, so index access sits behind one
-## lock (`svc.lock`). The embedding call runs before that lock is taken: Python is
-## already serialised by the GIL (see `pyembed`), and a failed model call must not
-## leave a half-done upsert behind. `pyembed.releaseGIL` hands the GIL back after
-## startup; `embedOne` takes it again per call.
+## lock (`svc.lock`). The embedding call runs before that lock is taken: the
+## llama.cpp context has its own lock inside `llama_embed` (a context is not
+## thread-safe), and a failed model call must not leave a half-done upsert
+## behind.
 ##
 ## Persistence: the metadata comes from `article_store`, and vectors and records
 ## both go to YottaDB, so a restart reopens the index and keeps answering.
 ##
 ## Run:
 ##   nim c --threads:on --mm:orc -d:release src/hnsw_service.nim
-##   PYTHONPATH=<venv site-packages> ./src/hnsw_service --port=8080
+##   HNSW_GGUF=~/models/gguf/<model>.gguf ./src/hnsw_service --port=8080
+##
+## The embedding model is a GGUF file loaded by llama.cpp; `HNSW_GGUF` or
+## `HNSW_GGUF_DIR` name it (see `llama_embed`). No Python, venv or PYTHONPATH.
 ##
 ## Index options (`--index`, `--model`, `--quant`, `--cache`, ...) are the ones
 ## every tool in this repo takes; see `hnsw_options`. `--port` and `--bind` are
@@ -42,10 +45,9 @@ import std/[json, locks, os, strutils, times]
 
 import mummy
 
-import ydbhnsw              # hnsw, hnsw_options, bert_nim, yottadb
+import ydbhnsw              # hnsw, hnsw_options, llama_embed, yottadb
 import hnsw_common
 import article_store
-import pyembed
 
 ## Routing is done by hand instead of with `mummy/routers`. That router is part
 ## of the mummyDS fork and calls `getSignals(request)` - the Datastar SSE path -
@@ -186,8 +188,8 @@ proc embedHandler(request: Request) {.gcsafe.} =
     return
 
   # Embed first, outside the index lock: a failing model call must not have
-  # already deleted the article it was replacing, and the lock should not be held
-  # while Python runs (the GIL serialises those calls anyway).
+  # already deleted the article it was replacing, and the index lock should not
+  # be held while llama.cpp runs (the embedding context serialises itself).
   var vector: seq[float32]
   try:
     vector = embedOne(hnswNormalize(articleText(article)))
@@ -294,22 +296,22 @@ proc indexHandler(request: Request) {.gcsafe.} =
   ## Service description and index stats - enough to see that the process is up
   ## and which index/model it is answering for.
   var live = 0
-  var dim = 0
+  var width = 0
   withLock svc.lock:
     live = svc.ix.liveCount
-    dim = svc.ix.dim
-  if dim == 0:
+    width = svc.ix.dim
+  if width == 0:
     # An index that has no vectors yet records no dimension either; the model
     # knows it, so report that instead of a bare 0.
     try:
-      dim = modelDim()
+      width = dim()
     except CatchableError:
       discard
   request.respondJson(200, %*{
     "status": "ok",
     "index": svc.ix.params.global,
     "model": svc.ix.params.model,
-    "dim": dim,
+    "dim": width,
     "live": live,
     "endpoints": {
       "GET /": "this description",
@@ -367,8 +369,9 @@ Everything else is an index option, identical to the other tools:
   --cache=BOOL        enable/disable the in-process vector and link caches
   --m, --efConstruction, --efSearch, --linkFmt, --scale, --verbose
 
-The embedding model runs in-process through the venv on PYTHONPATH, e.g.
-  PYTHONPATH=hnsw_env/lib/python3.14/site-packages ./hnsw_service
+The embedding model is a GGUF file run by llama.cpp in-process:
+  HNSW_GGUF=~/models/gguf/paraphrase-multilingual-MiniLM-L12-v2-f16.gguf ./hnsw_service
+  (or set HNSW_GGUF_DIR to the directory holding <model>.gguf)
 """
 
 proc cliInt(raw: string, what: string): int =
@@ -414,16 +417,13 @@ when isMainModule:
   let options = serviceArgs()
 
   # Index first: `openHnsw` loads the embedding model named by the index (META
-  # wins for an existing one), which has to happen on this thread, before the
-  # GIL is handed back.
+  # wins for an existing one), through the loader `llama_embed` registers at
+  # import time.
   let params = getHnswParams(args = options.indexArgs)
 
   svc = create(Service)
   svc.ix = openHnsw(params)
   initLock(svc.lock)
-
-  initEmbedding()
-  releaseGIL()
 
   let server = newServer(dispatch, workerThreads = ServiceWorkerThreads)
   echo "hnsw service on http://" & options.address & ":" & $options.port.int &

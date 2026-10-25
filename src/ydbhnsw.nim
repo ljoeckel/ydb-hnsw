@@ -1,4 +1,4 @@
-import bert_nim
+import llama_embed
 import hnsw
 import hnsw_options
 import yottadb
@@ -6,7 +6,7 @@ import yottadb
 when compileOption("profiler"):
     import std/nimprof
 
-export bert_nim
+export llama_embed
 export hnsw
 export hnsw_options
 export yottadb

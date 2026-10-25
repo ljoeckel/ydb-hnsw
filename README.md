@@ -3,23 +3,36 @@ A vector db implementation in Nim with YottaDB as database backend.
 It is implemented by using a HNSW index.
 A Hierarchical Navigable Small World (HNSW) Index is a highly efficient, graph-based algorithm for the approximate search for the nearest neighbors (Approximate Nearest Neighbor, ANN) in high-dimensional vector data. It is mainly used in modern vector databases and AI applications
 
-# Python3 install
+# Embedding backend: llama.cpp
 
-# Create a Virtual Environment
-python3 -m venv hnsw_env
-source hnsw_env/bin/activate
+Embeddings are computed in-process by [llama.cpp](https://github.com/ggml-org/llama.cpp)
+from a GGUF file. No Python, PyTorch or virtualenv is involved at runtime.
 
-# Install torch CPU-Only version:
-pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+```bash
+# build llama.cpp once (CPU is fine; add -DGGML_CUDA=ON for a CUDA build)
+git clone https://github.com/ggml-org/llama.cpp
+cmake -B llama.cpp/build -S llama.cpp -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
+cmake --build llama.cpp/build -j --target llama-embedding
 
-# Test
-In the ./python directory check torch installation with
- python3 verify.py
+export LLAMA_CPP_DIR=$PWD/llama.cpp/build   # what config.nims links against
+export HNSW_GGUF=~/models/gguf/paraphrase-multilingual-MiniLM-L12-v2.gguf
+# alternatively: HNSW_GGUF_DIR=<dir> (default ~/models/gguf), then <model>.gguf
+```
 
- # Install transformers
- pip3 install transformers
- pip3 install sentence_transformers
- pip3 install sentencepiece
+Converting the model is a one-time step and the only thing that still needs
+Python (torch + transformers):
+
+```bash
+pip install sentencepiece protobuf
+python llama.cpp/convert_hf_to_gguf.py \
+    sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 \
+    --outtype f16 --outfile "$HNSW_GGUF"
+```
+
+`convert_hf_to_gguf.py` mis-detects this model's XLM-R tokenizer, so apply
+`bash/llama_cpp_xlmroberta.patch` to llama.cpp first. `LLAMA_CPP.md` explains
+why, shows the verification (the vectors match the old torch path to <= 2.4e-4
+per component, top-5 ranking identical) and has the throughput numbers.
 
 # Setup Nim environment
 nimble setup
@@ -27,22 +40,21 @@ nimble setup
 
 `src/hnsw_service.nim` puts one HNSW index behind a small JSON API. The server is
 [mummyDS](https://github.com/ljoeckel/mummyDS) (mummy plus SSE/Datastar), the
-embedding runs in-process through the venv like the other tools, and vectors and
-article records both live in YottaDB - so a restart reopens the index and keeps
+embedding runs in the same process through llama.cpp, and vectors and article
+records both live in YottaDB - so a restart reopens the index and keeps
 answering.
 
 The service needs the mummyDS checkout and its `webby` / `crunchy` dependencies
-(see `requires` in `ydbhnsw.nimble`) and, like every tool here, the venv on
-`PYTHONPATH` - `bert_nim` imports the Python bridge at startup, even for
-`--help`.
+(see `requires` in `ydbhnsw.nimble`) and a GGUF model file (`HNSW_GGUF`, or
+`HNSW_GGUF_DIR/<model name>.gguf`).
 
 ```bash
 nim c --threads:on --mm:orc -d:release src/hnsw_service.nim
-PYTHONPATH=hnsw_env/lib/python3.14/site-packages \
+HNSW_GGUF=~/models/gguf/paraphrase-multilingual-MiniLM-L12-v2.gguf \
   ./src/hnsw_service --index=^HNSWArticles --port=8080
 ```
 
-`nimble runService` does both, with the venv looked up next to the nimble file.
+`nimble runService` builds and starts it.
 
 ## Endpoints
 

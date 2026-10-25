@@ -41,3 +41,17 @@ const ydbDist =
 
 {.passL: "-L" & ydbDist & " -lyottadb -Wl,-rpath," & ydbDist.}
 
+# --- llama.cpp embedding backend ---------------------------------------------
+# `src/llama_embed.nim` compiles `src/llama_shim.c` against llama.h and links the
+# shared llama/ggml libraries. LLAMA_CPP_DIR must be a llama.cpp *build*
+# directory - the one holding `bin/libllama.so`; the header is at `../include`.
+# Same shape as the YottaDB block above: environment first, local fallback.
+# Point it at any llama.cpp checkout you built, e.g.
+#   LLAMA_CPP_DIR=~/tools/llama.cpp/build nim c ...
+const llamaCppBuild =
+  block:
+    let fromEnv = getEnv("LLAMA_CPP_DIR")
+    if fromEnv.len > 0: fromEnv else: "/home/ljoeckel/git/llama.cpp/build"
+
+switch("define", "llamaCppDir=" & llamaCppBuild)
+

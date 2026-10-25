@@ -19,7 +19,8 @@ usage: <program> [option=value]...
   --linkFmt=MODE      The dataformat for the links. Defaults to lfUint32.
                       lfInt for int64 or lfUint32 for uint32
                       lfUint32 max indexsize is 4.294.967.295 entries.
-  --model=NAME        sentence-transformers model the vectors are built with.
+  --model=NAME        embedding model the vectors are built with. llama.cpp loads
+                      it from HNSW_GGUF, or from HNSW_GGUF_DIR/<NAME>.gguf.
                       Default """ & DefaultModel & """ - an index keeps the model
                       of its first vector, because vectors of two models do not mix.
                       Use 'NONE' to indicate not to load the model.
@@ -85,7 +86,7 @@ type
 
 
     HnswParams* = object
-        model*: string = DefaultModel   ## The hugging face model name
+        model*: string = DefaultModel   ## Embedding model name (a GGUF resolved by `llama_embed`)
         global*: string                 ## YottaDB global basename ^HNSWxxx
         globalNode*: string             ## YottaDB global ^HNSWxxxNODE
         globalLinks*: string            ## YottaDB global ^HNSWxxxLINKS

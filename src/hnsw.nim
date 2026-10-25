@@ -60,9 +60,9 @@
 ## first vector, next to the geometry: vectors of two different models cannot be
 ## compared, so a reopen uses the model recorded in the index, not the one the
 ## caller happens to pass. `openHnsw` hands that name to the loader the host
-## installs through `setModelLoader` (`bert_nim.loadModel` does it when it is
-## imported), which keeps this module free of Python - a program that never
-## embeds, like the tests, opens indexes without loading a model.
+## installs through `setModelLoader` (`llama_embed.loadModel` does it when it is
+## imported), which keeps this module free of the embedding backend - a program
+## that never embeds, like the tests, opens indexes without loading a model.
 ##
 ## A neighbour id on disk is either `int64` (`lfInt`, 8 bytes, and
 ## what every index built before the option existed holds) or `uint32`
@@ -172,9 +172,9 @@ type
   ModelLoader* = proc(model: string): string
     ## How `openHnsw` reaches the embedding model named in `HnswParams.model`:
     ## load `model` and return the name it ends up loaded under. The host program
-    ## installs it with `setModelLoader` - `bert_nim.nim` does that at import
-    ## time - which is what keeps this module free of Python. A program that
-    ## never embeds (the pure-Nim tests) leaves it nil.
+    ## installs it with `setModelLoader` - `llama_embed.nim` does that at import
+    ## time - which is what keeps this module free of the embedding backend. A
+    ## program that never embeds (the pure-Nim tests) leaves it nil.
 
   Neighbor* = tuple[dist: float32, id: int]
 
@@ -1756,7 +1756,7 @@ var modelLoader: ModelLoader = nil
 
 proc setModelLoader*(loader: ModelLoader) =
   ## Install the way `openHnsw` loads the model named in `HnswParams.model` - see
-  ## `ModelLoader`. `bert_nim.loadModel` is what the embedding side registers.
+  ## `ModelLoader`. `llama_embed.loadModel` is what the embedding side registers.
   modelLoader = loader
 
 proc deriveGlobalNames(p: var HnswParams) =

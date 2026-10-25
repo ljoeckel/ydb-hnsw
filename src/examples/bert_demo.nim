@@ -1,19 +1,18 @@
-## Call the Python sentence-transformers pipeline from Nim, via nimpy.
+## Embed texts and rank them, using the llama.cpp backend directly.
 ##
-## Build:  nimble build
-## Run:    nimble runNim          (sets PYTHONPATH to the venv, see ydbhnsw.nimble)
-##   or:   PYTHONPATH=/home/ljoeckel/git/ydb-hnsw/hnsw_env/lib/python3.12/site-packages ./bert_nim
+## No index needed: this only exercises `llama_embed` (loadModel / embed /
+## embedFlat / query).
 ##
-## nimpy embeds a CPython interpreter into this binary (it dlopens libpython at
-## runtime), so this process *becomes* a Python host. Everything the Python code
-## needs - sentence_transformers, numpy, torch - must be importable by that
-## interpreter. Since we embed the system libpython3.12, the venv's
-## site-packages are supplied through PYTHONPATH.
+## Build:  nim c -d:release src/examples/bert_demo.nim
+## Run:    HNSW_GGUF=~/models/gguf/<model>.gguf ./src/examples/bert_demo
+##   or:   nimble runNim          (see the task in ydbhnsw.nimble)
+##
+## The model file is resolved by `llama_embed.resolveModelFile`: HNSW_GGUF wins,
+## then a `.gguf` path, then HNSW_GGUF_DIR/<name>.gguf. No Python is involved.
 
 #import ../ydbhnsw
 
-import nimpy
-import ../bert_nim
+import ../llama_embed
 
 
 when isMainModule:
@@ -24,7 +23,7 @@ when isMainModule:
   # loaded model, and so do embed()/embedFlat().
   echo &"model: {loadModel()}"
 
-  # Embedding size of the loaded model, asked from Python (384 for MiniLM-L6).
+  # Embedding size of the loaded model (384 for the MiniLM default).
   let embeddingDim = dim()
 
   let texts = @[
@@ -46,8 +45,7 @@ when isMainModule:
     "MacMini has doubled price due to memory shortness",
   ]
 
-  echo &"python {pyImport(\"sys\").version.to(string).split(chr(10))[0]}, " &
-       &"embedding dim = {embeddingDim}"
+  echo &"embedding dim = {embeddingDim}"
 
   # Both article groups make up one corpus. Row i of `vectors` has to line up
   # with allTexts[i]; indexing into `texts` alone breaks as soon as `texts2`

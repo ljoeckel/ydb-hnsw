@@ -1,0 +1,25 @@
+diff --git a/conversion/bert.py b/conversion/bert.py
+index f247154..2f64942 100644
+--- a/conversion/bert.py
++++ b/conversion/bert.py
+@@ -37,7 +37,20 @@ class BertModel(TextModel):
+         if self.cls_out_labels:
+             self.gguf_writer.add_classifier_output_labels([v for k, v in sorted(self.cls_out_labels.items())])
+ 
++    def _tokenizer_is_unigram(self) -> bool:
++        with open(self.dir_model / "tokenizer.json") as f:
++            return json.load(f)["model"]["type"] == "Unigram"
++
+     def set_vocab(self):
++        if self._tokenizer_is_unigram():
++            # XLM-R style SentencePiece BERT (config says "BertModel", tokenizer
++            # is a Unigram/SentencePiece model - e.g.
++            # sentence-transformers/paraphrase-multilingual-MiniLM-*).  The
++            # WordPiece phantom-space rewrite below would destroy the vocab and
++            # lose the unigram scores / charsmap / space prefix the tokenizer
++            # needs, so use the XLM-R path instead.
++            return self._xlmroberta_set_vocab()
++
+         tokens, toktypes, tokpre = self.get_vocab_base()
+         self.vocab_size = len(tokens)
+ 
