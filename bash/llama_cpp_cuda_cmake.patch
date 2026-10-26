@@ -1,0 +1,26 @@
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index 297d9ff..59ee518 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -200,14 +200,13 @@ if (CUDAToolkit_FOUND)
+         add_compile_definitions(GGML_CUDA_DEBUG)
+     endif()
+ 
+-    if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+-        # Options are:
+-        # - none (not recommended)
+-        # - speed (nvcc's default)
+-        # - balance
+-        # - size
+-        list(APPEND CUDA_FLAGS -compress-mode=${GGML_CUDA_COMPRESSION_MODE})
+-    endif()
++    # NOTE(local patch): CMake 4.x passes -forward-unknown-to-host-compiler, so
++    # nvcc hands -compress-mode to the host C++ compiler, where gcc rejects it
++    # ("unrecognized command-line option"). The flag only shrinks the linked
++    # binary, so it is skipped here.
++    #if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
++    #    list(APPEND CUDA_FLAGS -compress-mode=${GGML_CUDA_COMPRESSION_MODE})
++    #endif()
+ 
+     if (GGML_FATAL_WARNINGS)
+         list(APPEND CUDA_FLAGS -Werror all-warnings)

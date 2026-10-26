@@ -9,7 +9,7 @@ Embeddings are computed in-process by [llama.cpp](https://github.com/ggml-org/ll
 from a GGUF file. No Python, PyTorch or virtualenv is involved at runtime.
 
 ```bash
-# build llama.cpp once (CPU is fine; add -DGGML_CUDA=ON for a CUDA build)
+# build llama.cpp once (add -DGGML_CUDA=ON for the GPU, see below)
 git clone https://github.com/ggml-org/llama.cpp
 cmake -B llama.cpp/build -S llama.cpp -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build llama.cpp/build -j --target llama-embedding
@@ -19,6 +19,12 @@ export HNSW_GGUF=~/models/gguf/paraphrase-multilingual-MiniLM-L12-v2.gguf
 # alternatively: HNSW_GGUF_DIR=<dir> (default ~/models/gguf), then <model>.gguf
 ```
 
+GPU: nothing changes in this repo - build llama.cpp with `-DGGML_CUDA=ON`
+(`-DCMAKE_CUDA_ARCHITECTURES=<cc>`, e.g. `61` for a GTX 1060). The backend then
+offloads the model automatically when a GPU is present and falls back to the CPU
+if that load fails; `HNSW_EMBED_GPU_LAYERS=0` pins the CPU. CMake 4.x needs
+`bash/llama_cpp_cuda_cmake.patch` for the CUDA build (details in `LLAMA_CPP.md`).
+
 Converting the model is a one-time step and the only thing that still needs
 Python (torch + transformers):
 
@@ -26,8 +32,15 @@ Python (torch + transformers):
 pip install sentencepiece protobuf
 python llama.cpp/convert_hf_to_gguf.py \
     sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 \
-    --outtype f16 --outfile "$HNSW_GGUF"
+    --outtype q8_0 --outfile "$HNSW_GGUF"
 ```
+
+`q8_0` is the recommended file when a GPU is present: llama.cpp's CUDA int8
+matmul is ~25% faster than F16 here and the vector error (cos >= 0.99985 vs the
+old torch output) is below the `vqInt8` quantisation the index applies anyway.
+Use `--outtype f16` on a CPU-only build (or for reference vectors). Either way,
+build the index with the same file you later query with - vectors of different
+quants differ slightly.
 
 `convert_hf_to_gguf.py` mis-detects this model's XLM-R tokenizer, so apply
 `bash/llama_cpp_xlmroberta.patch` to llama.cpp first. `LLAMA_CPP.md` explains

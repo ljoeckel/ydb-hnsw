@@ -26,6 +26,13 @@
 ## GIL dance: the model is loaded once, and workers serialise on the same lock
 ## the Python calls used to serialise on implicitly.
 ##
+## GPU: whether llama.cpp was built with CUDA/Metal/Vulkan is a property of the
+## library, so nothing here needs to know. When the library reports a GPU device
+## the model is offloaded automatically (`HNSW_EMBED_GPU_LAYERS` unset); if that
+## load fails - no VRAM, driver mismatch - it retries on the CPU instead of
+## failing the service. `HNSW_EMBED_GPU_LAYERS=0` pins the CPU, `-1` offloads
+## every layer, `n > 0` offloads `n` layers.
+##
 ## The C side lives in `llama_shim.c` (compiled in below). It exists because
 ## llama.h passes `llama_model_params`, `llama_context_params` and `llama_batch`
 ## by value and those layouts change between releases; the shim is compiled
@@ -46,21 +53,31 @@ when llamaCppDir.len > 0:
   # The rpath points at the llama.cpp build tree, the same way the YottaDB block
   # in config.nims points at libyottadb; libllama carries its own RUNPATH for
   # libggml, so one entry is enough.
-  {.passL: "-L" & llamaBin & " -lllama -Wl,-rpath," & llamaBin.}
+  # -lggml/-lggml-base are needed explicitly since the CUDA build: libllama.so
+  # reaches ggml symbols directly and ld wants them named on the link line.
+  {.passL: "-L" & llamaBin & " -lllama -lggml -lggml-base -Wl,-rpath," & llamaBin.}
 else:
   {.passL: "-lllama".}
 
 {.compile: "llama_shim.c".}
 
 const
-  DefaultCtx = 512
-    ## tokens per decode; also the per-batch token budget (`n_batch`/`n_ubatch`)
+  DefaultCtx = 256
+    ## tokens per decode; also the per-batch token budget (`n_batch`/`n_ubatch`).
+    ## Measured on a GTX 1060: 256 is the sweet spot. llama.cpp builds one
+    ## attention mask over the whole packed batch, so a bigger decode is slower
+    ## (512/1024/2048/4096 tokens = 1000/765/629/428 texts/s), and 256 still
+    ## leaves room for the 128-token truncation.
   DefaultSeqs = 64
     ## sequences per decode (`n_seq_max`); a batch is also capped by the token budget
   DefaultThreads = 4
     ## llama.cpp compute threads; override with HNSW_EMBED_THREADS
   DefaultMaxTokens = 128
     ## the model's max_seq_length - the old torch path truncated here too
+  GpuLayersAuto = -2
+    ## HNSW_EMBED_GPU_LAYERS unset: use the GPU when llama.cpp has one
+  GpuLayersAll = -1
+    ## llama.cpp: a negative layer count means "all layers"
   ErrLen = 512
   PathLen = 1024
 
@@ -77,7 +94,8 @@ type
 # --- the C shim (src/llama_shim.c) ------------------------------------------
 
 proc cBackendInit(quiet: cint) {.importc: "shim_backend_init", cdecl.}
-proc cBackendFree() {.importc: "shim_backend_free", cdecl.}
+proc cGpuDeviceCount(): cint {.importc: "shim_gpu_device_count", cdecl.}
+proc cGpuDeviceName(): cstring {.importc: "shim_gpu_device_name", cdecl.}
 proc cLoadModel(path: cstring, nGpuLayers: cint, err: cstring, errLen: csize_t): Model
   {.importc: "shim_load_model", cdecl.}
 proc cFreeModel(model: Model) {.importc: "shim_free_model", cdecl.}
@@ -86,15 +104,12 @@ proc cNewContext(model: Model, nCtx, nBatch, nSeqMax, nThreads, nThreadsBatch, p
   {.importc: "shim_new_context", cdecl.}
 proc cFreeContext(ctx: Context) {.importc: "shim_free_context", cdecl.}
 proc cNEmbdOut(model: Model): int32 {.importc: "shim_n_embd_out", cdecl.}
-proc cPoolingType(ctx: Context): cint {.importc: "shim_pooling_type", cdecl.}
 proc cTokenize(model: Model, text: cstring, textLen: cint, outIds: ptr int32,
                outCap: cint, addSpecial, parseSpecial: cint): cint
   {.importc: "shim_tokenize", cdecl.}
-proc cSeqEndToken(model: Model): cint {.importc: "shim_seq_end_token", cdecl.}
 proc cBatchNew(nTokens, nSeqMax: cint): Batch {.importc: "shim_batch_new", cdecl.}
 proc cBatchFree(batch: Batch) {.importc: "shim_batch_free", cdecl.}
 proc cBatchReset(batch: Batch) {.importc: "shim_batch_reset", cdecl.}
-proc cBatchCapacity(batch: Batch): cint {.importc: "shim_batch_capacity", cdecl.}
 proc cBatchAdd(batch: Batch, token, pos, seq: cint): cint
   {.importc: "shim_batch_add", cdecl.}
 proc cDecode(ctx: Context, batch: Batch, err: cstring, errLen: csize_t): cint
@@ -157,6 +172,20 @@ proc envPooling(): cint =
     raise newException(ValueError,
       "HNSW_EMBED_POOLING must be mean, cls, last or none")
 
+proc envGpuLayers(): int =
+  ## `GpuLayersAuto` (nothing set) = offload everything when a GPU backend is
+  ## present, stay on the CPU otherwise. 0 pins the CPU, -1 means all layers,
+  ## n > 0 is a layer count.
+  let raw = getEnv("HNSW_EMBED_GPU_LAYERS")
+  if raw.len == 0:
+    return GpuLayersAuto
+  try:
+    result = parseInt(raw.strip)
+  except ValueError:
+    raise newException(ValueError,
+      "HNSW_EMBED_GPU_LAYERS must be an integer (-1 = all layers, 0 = CPU), got '" &
+      raw & "'")
+
 proc resolveModelFile(name: string): string =
   ## Name (as pinned in the index) -> GGUF path. See the module doc for the order.
   let explicit = getEnv("HNSW_GGUF")
@@ -173,7 +202,9 @@ proc resolveModelFile(name: string): string =
 
   let dir = getEnv("HNSW_GGUF_DIR", getHomeDir() / "models" / "gguf")
   var tried: seq[string]
-  for suffix in [".gguf", "-f16.gguf", "-f32.gguf"]:
+  # An unqualified file name wins, then the quantised variants this project
+  # ships/most often builds (q8_0 is the recommended one on a GPU).
+  for suffix in [".gguf", "-q8_0.gguf", "-f16.gguf", "-f32.gguf"]:
     let candidate = dir / (wanted & suffix)
     if fileExists(candidate):
       return candidate
@@ -271,12 +302,53 @@ proc embedAll(texts: seq[string]): seq[float32] =
 
 # --- public API -------------------------------------------------------------
 
+proc openGguf(path: string, layers, nCtx, nSeqs, nThreads, pooling: int): tuple[m: Model, c: Context] =
+  ## Load the GGUF and create its embedding context. Frees the model again if the
+  ## context cannot be created, so a failure here leaks nothing.
+  var err: array[ErrLen, char]
+  let m = cLoadModel(path.cstring, cint(layers),
+                     cast[cstring](unsafeAddr err[0]), csize_t(err.len))
+  if m == nil:
+    raise newException(IOError, errStr(err))
+  let c = cNewContext(m, cint(nCtx), cint(nCtx), cint(nSeqs),
+                      cint(nThreads), cint(nThreads), cint(pooling),
+                      cast[cstring](unsafeAddr err[0]), csize_t(err.len))
+  if c == nil:
+    cFreeModel(m)
+    raise newException(IOError, errStr(err))
+  (m, c)
+
+proc publish(m: Model, c: Context, path: string) =
+  ## Adopt a freshly opened model. Called only after everything succeeded, so a
+  ## failed reload never leaves a half-open model behind.
+  model = m
+  ctx = c
+  embdDim = int(cNEmbdOut(m))
+  let trimmed = if path.len >= PathLen: path[0 ..< PathLen - 1] else: path
+  for i, ch in trimmed:
+    loadedPath[i] = ch
+  loadedPath[trimmed.len] = '\0'
+
+proc releaseModel() =
+  if ctx != nil:
+    cFreeContext(ctx)
+    ctx = nil
+  if model != nil:
+    cFreeModel(model)
+    model = nil
+  loadedPath[0] = '\0'
+
 proc loadModel*(name: string = hnsw.DefaultModel): string =
   ## Load (or keep) the GGUF for `name` and return the name it is loaded under.
   ##
   ## `openHnsw` calls this through `hnsw.setModelLoader`, so the index's META
   ## decides which model gets loaded; a program that embeds without opening an
   ## index calls it directly. Loading the same file again is a no-op.
+  ##
+  ## Returns only once the model has produced one embedding, so the CUDA context
+  ## and compute graph are already built: the first real request is not the slow
+  ## one, and a GPU that cannot actually run the model is still retried on the
+  ## CPU here instead of on the first search.
   let wanted = if name.len == 0: DefaultModel else: name
   acquire(lock)
   defer: release(lock)
@@ -289,56 +361,71 @@ proc loadModel*(name: string = hnsw.DefaultModel): string =
     cBackendInit(cint(if envBool("HNSW_LLAMA_LOG", false): 0 else: 1))
     backendReady = true
 
-  var err: array[ErrLen, char]
-
-  # Release the previous model before loading the next one: a GGUF is ~240 MB
-  # and an index reopen with a different model should not hold both.
-  if ctx != nil:
-    cFreeContext(ctx)
-    ctx = nil
-  if model != nil:
-    cFreeModel(model)
-    model = nil
-  loadedPath[0] = '\0'
-
-  let nGpu = envInt("HNSW_EMBED_GPU_LAYERS", 0)
-  let fresh = cLoadModel(path.cstring, cint(nGpu),
-                         cast[cstring](unsafeAddr err[0]), csize_t(err.len))
-  if fresh == nil:
-    raise newException(IOError, errStr(err))
-
   let nCtx = envInt("HNSW_EMBED_CTX", DefaultCtx)
   let nSeqs = envInt("HNSW_EMBED_SEQS", DefaultSeqs)
   let nThreads = envInt("HNSW_EMBED_THREADS", DefaultThreads)
   if nCtx <= 0:
-    cFreeModel(fresh)
     raise newException(ValueError, "HNSW_EMBED_CTX must be positive")
   if nSeqs <= 0:
-    cFreeModel(fresh)
     raise newException(ValueError, "HNSW_EMBED_SEQS must be positive")
+  let pooling = envPooling()
 
-  let freshCtx = cNewContext(fresh, cint(nCtx), cint(nCtx), cint(nSeqs),
-                             cint(nThreads), cint(nThreads),
-                             envPooling(),
-                             cast[cstring](unsafeAddr err[0]), csize_t(err.len))
-  if freshCtx == nil:
-    cFreeModel(fresh)
-    raise newException(IOError, errStr(err))
+  let requested = envGpuLayers()
+  var layers = if requested == GpuLayersAuto:
+                 (if cGpuDeviceCount() > 0: GpuLayersAll else: 0)
+               else: requested
 
-  model = fresh
-  ctx = freshCtx
-  embdDim = int(cNEmbdOut(fresh))
+  # Release the previous model before loading the next one: a GGUF is ~240 MB
+  # and an index reopen with a different model should not hold both.
+  releaseModel()
+
+  # Announce the load before it starts: it is the one step that can fail, and a
+  # silent startup is otherwise indistinguishable from a stalled one.
+  stderr.writeLine("llama_embed: loading " & wanted & " from " & path &
+                   " (" & (if layers != 0: "GPU" else: "CPU") & ")")
+
+  var opened: tuple[m: Model, c: Context]
+  try:
+    opened = openGguf(path, layers, nCtx, nSeqs, nThreads, pooling)
+  except IOError as e:
+    if layers == 0:
+      raise
+    # A CUDA build on a box without enough VRAM (or with a driver mismatch)
+    # must not take the process down: report it and use the CPU.
+    stderr.writeLine("llama_embed: GPU load failed (" & e.msg &
+                     "); retrying on the CPU")
+    layers = 0
+    opened = openGguf(path, 0, nCtx, nSeqs, nThreads, pooling)
+
+  publish(opened.m, opened.c, path)
   batchTokens = nCtx
   seqMax = nSeqs
   # The model's max_seq_length is 128; never tokenize past the batch either.
-  let requested = envInt("HNSW_EMBED_MAX_TOKENS", DefaultMaxTokens)
-  maxTokens = if requested <= 0: batchTokens else: min(requested, batchTokens)
+  let maxRequested = envInt("HNSW_EMBED_MAX_TOKENS", DefaultMaxTokens)
+  maxTokens = if maxRequested <= 0: batchTokens else: min(maxRequested, batchTokens)
 
-  # Record the path that is actually open; written last, only on success.
-  let trimmed = if path.len >= PathLen: path[0 ..< PathLen - 1] else: path
-  for i, ch in trimmed:
-    loadedPath[i] = ch
-  loadedPath[trimmed.len] = '\0'
+  # Warm-up decode. This is where the CUDA context and the compute graph get
+  # built, which costs far more than a normal batch; doing it here means the
+  # first request is not the slow one, and a GPU that fails to decode is still
+  # caught while the CPU fallback is available.
+  try:
+    discard embedAll(@["warm up"])
+  except CatchableError as e:
+    if layers == 0:
+      raise
+    stderr.writeLine("llama_embed: GPU decode failed (" & e.msg &
+                     "); reloading on the CPU")
+    releaseModel()
+    layers = 0
+    opened = openGguf(path, 0, nCtx, nSeqs, nThreads, pooling)
+    publish(opened.m, opened.c, path)
+    discard embedAll(@["warm up"])
+
+  let where = if layers == 0: "CPU"
+              else: "GPU (" & $cGpuDeviceName() & ")"
+  stderr.writeLine("llama_embed: " & wanted & " from " & path & " - " &
+                   $embdDim & " dims, " & where & ", " & $nCtx &
+                   " tokens/batch, " & $seqMax & " seqs")
 
   result = wanted
 

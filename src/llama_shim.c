@@ -12,6 +12,7 @@
 // own symbols.
 
 #include <llama.h>
+#include <ggml-backend.h>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -44,6 +45,33 @@ void shim_backend_init(int quiet) {
 
 void shim_backend_free(void) {
     llama_backend_free();
+}
+
+// How many GPU devices llama.cpp's backends registered. Used to decide whether
+// to offload by default; 0 on a CPU-only build, whatever the hardware.
+int shim_gpu_device_count(void) {
+    int count = 0;
+    const size_t ndev = ggml_backend_dev_count();
+    for (size_t i = 0; i < ndev; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (dev != NULL && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+// Description of the first GPU device ("NVIDIA GeForce GTX 1060 6GB"), or ""
+// when there is none. Owned by the backend; the caller copies it.
+const char * shim_gpu_device_name(void) {
+    const size_t ndev = ggml_backend_dev_count();
+    for (size_t i = 0; i < ndev; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (dev != NULL && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            return ggml_backend_dev_description(dev);
+        }
+    }
+    return "";
 }
 
 struct llama_model * shim_load_model(const char * path, int n_gpu_layers,
@@ -100,10 +128,6 @@ int32_t shim_n_embd_out(const struct llama_model * model) {
     return llama_model_n_embd_out(model);
 }
 
-int shim_pooling_type(const struct llama_context * ctx) {
-    return (int) llama_pooling_type(ctx);
-}
-
 // Returns the token count, or its negation when the buffer is too small (the
 // same convention llama_tokenize uses).
 int shim_tokenize(const struct llama_model * model,
@@ -114,16 +138,6 @@ int shim_tokenize(const struct llama_model * model,
     return llama_tokenize(vocab, text, text_len,
                           (llama_token *) out, out_cap,
                           add_special != 0, parse_special != 0);
-}
-
-// Token used to close a truncated sequence (SentencePiece </s> for XLM-R).
-int shim_seq_end_token(const struct llama_model * model) {
-    const struct llama_vocab * vocab = llama_model_get_vocab(model);
-    llama_token tok = llama_vocab_sep(vocab);
-    if (tok == LLAMA_TOKEN_NULL) {
-        tok = llama_vocab_eos(vocab);
-    }
-    return (int) tok;
 }
 
 // --- batch ---------------------------------------------------------------
@@ -161,10 +175,6 @@ void shim_batch_free(void * handle) {
 void shim_batch_reset(void * handle) {
     struct shim_batch * sb = handle;
     sb->batch.n_tokens = 0;
-}
-
-int shim_batch_capacity(const void * handle) {
-    return ((const struct shim_batch *) handle)->cap;
 }
 
 // Append one token: `seq` is the sequence it belongs to, `pos` its position in
