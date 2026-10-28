@@ -106,6 +106,36 @@ llama.cpp is built with `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=61`
 - **Link line**: with the CUDA build, `libllama.so` reaches ggml symbols
   directly, so the binary must name them: `-lllama -lggml -lggml-base`
   (`llama_embed.nim`).
+- **Web-UI asset target (build stops at ~94 %)**: `make` also runs
+  `llama-ui-assets`, an `ALL` custom target that provisions the server's
+  embedded UI and gzips it, even though nothing here uses `llama-server`. When
+  the checkout is reached through a symlink (`/home/ljoeckel/git/llama.cpp` is
+  really `/tank/home/ljoeckel/git/llama.cpp`), CMake caches
+  `CMAKE_HOME_DIRECTORY` in the symlink form but resolves the provisioned dist
+  to the real path, so the gzip step builds
+  `../../../../../../../tank/home/...` and dies:
+
+  ```
+  CMake Error: Unable to read from file
+    '../../../../../../../tank/home/ljoeckel/git/llama.cpp/build/tools/ui/dist/
+     _app/immutable/assets/bundle.B8MbgIB2.css' ... file failed to compress
+  ```
+
+  Fix: drop the compression step and re-run the build (only the UI target
+  rebuilds, no CUDA recompile):
+
+  ```
+  cd ~/git/llama.cpp/build && cmake -DLLAMA_UI_GZIP=OFF . && make -j16
+  ```
+
+  `-DLLAMA_BUILD_UI=OFF` alone does *not* help: it is already the default and
+  only selects the prebuilt download instead of an `npm` build. Alternatives are
+  to build the needed targets only
+  (`cmake --build build -j16 --target llama-embedding llama-quantize`) or to
+  configure from the real path (`cmake -S /tank/home/ljoeckel/git/llama.cpp ...`
+  after wiping `build/`, since `CMAKE_HOME_DIRECTORY` cannot change in place).
+  Everything this project links (`libllama`, `libggml*`,
+  `llama-embedding`) builds fine either way.
 
 Behaviour: `HNSW_EMBED_GPU_LAYERS` unset means "offload everything when the
 library reports a GPU device, otherwise stay on the CPU"; a failed GPU load is

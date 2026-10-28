@@ -37,7 +37,7 @@ if not defined(hnswNoSimd):
 const ydbDist =
   block:
     let fromEnv = getEnv("ydb_dist")
-    if fromEnv.len > 0: fromEnv else: "/usr/local/lib/yottadb/r206"
+    if fromEnv.len > 0: fromEnv else: "/usr/local/lib/yottadb/r207"
 
 {.passL: "-L" & ydbDist & " -lyottadb -Wl,-rpath," & ydbDist.}
 

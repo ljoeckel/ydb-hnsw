@@ -1101,6 +1101,7 @@ proc loadVec*(ix: HnswIndex, id: int): StoredVec =
     result.scale = ix.params.quantScale
     result.codes = unpackInt8(blob)
 
+
 proc vecViewAt(ix: HnswIndex, id: int, holder: var StoredVec): VecView =
   ## Borrowed view of `id`'s vector, for the paths that compare many vectors
   ## with each other instead of scoring one query against each of them.
@@ -1977,8 +1978,7 @@ proc openHnsw*(p: HnswParams): HnswIndex =
     result.params.linkFmt = p.linkFmt
 
   if result.params.quant == vqInt8Fixed and result.params.quantScale <= 0:
-    raise newException(ValueError,
-      "vqInt8Fixed needs a positive quantScale, e.g. quantizeScale(sample)")
+    raise newException(ValueError, "vqInt8Fixed needs a positive quantScale, e.g. quantizeScale(sample)")
 
   # The embedding model belongs to the index's identity, like its dimension and
   # its storage mode: a vector is only comparable to one from the same model, so

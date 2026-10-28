@@ -1,16 +1,46 @@
-import std/[strformat, strutils, sets, enumerate]
+import std/[strformat, wordwrap, parseopt, strutils, sets, enumerate]
 import ../ydbhnsw
 import hnsw_common
 import rsstypes
 
 const
-    BatchSize = 128
     MinDescriptionLen = 35
     MinSim = 0.90'f32
     RemoveDups = false
 
-## Report counters
-var empty, duplicates, skipped, queries, similar = 0
+    Usage = """
+    usage: <program> [option=value]...
+
+    --[HnswOption]      Will be processed by HnswOption
+    --id, -i            Lookup by Hnsw Index id
+    """
+
+type
+    AppOptions = object
+        id: int
+
+
+## counters
+var idxid, empty, duplicateTitles, duplicateDescriptions, queries, similar = 0
+
+
+proc getAppOptions(): AppOptions =
+    result = AppOptions()
+
+    for kind, key, val in getopt():  
+      case kind
+      of cmdEnd: break
+      of cmdShortOption, cmdLongOption:
+        case toLowerAscii(key)
+        of "id", "i": result.id = parseInt(val)
+        of "help", "h": echo Usage
+        else: discard
+      else:
+        discard
+
+
+proc logCounters() =
+    echo &"LastId: {idxid}, Queries: {queries}, Similar: {similar} Empty: {empty}, dupTitles: {duplicateTitles}, dupDesc: {duplicateDescriptions}"
 
 
 proc sanitize(description: string): bool =
@@ -19,74 +49,88 @@ proc sanitize(description: string): bool =
     false
 
 
-proc delete(ix: HnswIndex, hit: Hit) =
+proc deleteItem(ix: HnswIndex, id: int) =
     # Get rssref to access ydb
-    let rssref = getRssRef(hit.id)
+    let rssref = getRssRef(id)
     if rssref.len == 0:
         echo &"Could not find storage reference {rssref}"
         return
 
     # Remove form HNSW vector db
-    let rc = ix.delete(hit.id)
+    let rc = ix.delete(id)
     if not rc:
-        echo &"Could not delete {hit.id} from HNSW index"
+        echo &"Could not delete {id} from HNSW index"
         return
 
     # Remove from YottaDB
     deleteObject[RSSItem](rssref)
+    if ix.params.verbose:
+        echo &"RSSItem {rssref} and HNSW index entry {id} deleted"
 
 
-proc findDuplicates(ix: HnswIndex, self: int, title: string, vec: seq[float32], k = 10, minSim = MinSim, remove = false) =
-    let hits = ix.search(vec, k = k, ef = max(k * 4, ix.params.efSearch))
+proc loadRSSItem(idxref: string): RSSItem =
+    result = loadObject[RSSItem](idxref.split(","))    
 
-    var seen = initHashSet[string]()
-    seen.incl getRssDescription(self)
 
-    var found = 0
+proc searchDuplicates(ix: HnswIndex, self: int, k: int = 5, ef = max(k * 4, ix.params.efSearch)) =
+    var info: seq[string]
+
+    let gblNode = ix.params.globalNode
+    let selfTitle = getRSSTitle(self)
+    let selfDescription = getRssDescription(self)
+
+    let vec = Get @gblNode(self)
+    let hits = ix.searchBlob(vec, k=k, ef=ef)
     for hit in hits:
-        if hit.id == self:
-            continue                    # the article itself, similarity ~= 1.0
-        if hit.sim() < minSim:
-            continue                    # nearest, but not similar
-        if found == 0:
-            echo title
-            inc similar
-        inc found
+        if hit.id == self: continue
+        if hit.sim() < MinSim: continue
+        let title = getRSSTitle(hit.id)
+        let description = getRSSDescription(hit.id)
 
-        let description = getRssDescription(hit.id)
-        echo &"   {hit.sim():.4f} {hit.id} : {getRssTitle(hit.id)}"
-        #echo &"                     - {description}"
+        if title == selfTitle:
+            inc duplicateTitles
+            if selfDescription == description:
+                inc duplicateDescriptions
+                deleteItem(ix, hit.id) # delete real duplicate              
+            else:
+                info.add(&"{hit.id:>8} {title} {hit.sim():.4f}")
+                info.add(description.wrapWords(maxLineWidth = 80).indent(9))
 
-        if sanitize(description):
-            inc empty
-            if remove: delete(ix, hit)
-        elif description in seen:
-            inc duplicates
-            if remove: delete(ix, hit)
-        else:
-            seen.incl description
-
+    if info.len > 0 and ix.params.verbose:
+        echo &"{self:<8} {selfTitle}"
+        echo selfDescription.wrapWords(maxLineWidth = 80).indent(9)
+        for line in info:
+            echo line
 
 
 when isMainModule:
-    let params = hnswParams("^HNSWArticles", cacheVectors=true, batchSize=BatchSize)
-    echo &"Opening the HNSW index with {params}"
-    let ix = openHnsw(params)
+    let options = getAppOptions()
+    var params = getHnswParams()
 
-    for (cnt, id, title, vec) in enumerate(batchedRSSTitleIter(ix)):
-        findDuplicates(ix, id, title, vec, remove=RemoveDups)
+    let ix = openHnsw(params)
+    let gblKey = ix.params.globalKey
+
+    if options.id > 0:
+        ix.searchDuplicates(options.id)
+        quit(0)
+
+    for cnt, id, idxref in enumerate(OrderItr @gblKey.kv.reverse):
+        if id.contains(","): continue
+        
+        idxid = parseInt(id)
+        let title = getRSSTitle(idxref)
+        let description = getRssDescription(idxref)
+
+        if sanitize(description):
+            inc empty
+            deleteItem(ix, idxid)
+            continue
+         
+        ix.searchDuplicates(idxid)
+
         inc queries
 
         if cnt mod params.batchSize == 0:
-            echo &"findDuplicates cnt:{cnt}, queries:{queries}, similar:{similar}, " &
-                 &"skipped:{skipped}, empty:{empty}, duplicates:{duplicates}"
-            #updateDBStats("hnsw_clean") 
-
-        #if cnt > BatchSize: break
+            logCounters()
     
-    echo "   Queries: ", queries
-    echo "   Similar: ", similar
-    echo "   Skipped: ", skipped
-    echo "     Empty: ", empty
-    echo "Duplicates: ", duplicates
-    #updateDBStats("hnsw_clean")
+    logCounters()

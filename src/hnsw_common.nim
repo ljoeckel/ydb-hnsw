@@ -126,41 +126,33 @@ iterator batchedRSSTitleIter*(ix: HnswIndex): IterResult =
 proc getRssRef*(id: int): seq[string] =
     let rssref = Get ^HNSWArticlesKEY(id)
     if rssref.len > 0 and rssref.contains(","):
-        rssref.split(",")
-    else:
-        @[]
+        return rssref.split(",")
 
-proc getRssTitle*(subs: seq[string]): string = 
+proc getRssTitle*(subs: seq[string], normalize:bool = true): string = 
     result = Get ^RSSItem(subs, "title")
-    #if result.len > 0:
-        #return hnswNormalize(title)
-    #    return title
-    #else:
-    #    return ""
+    if normalize:
+        return hnswNormalize(result)
 
-proc getRssTitle*(rssref: string): string = 
+proc getRssTitle*(rssref: string, normalize: bool = true): string = 
     if rssref.len > 0 and rssref.contains(","):
         let subs = rssref.split(",")
-        getRssTitle(subs)
-    else:
-        return ""
+        return getRssTitle(subs, normalize)
 
-proc getRssTitle*(id: int): string =
-    getRssTitle(getRssRef(id))
+proc getRssTitle*(id: int, normalize: bool = true): string =
+    getRssTitle(getRssRef(id), normalize)
 
 
-proc getRssDescription*(subs: seq[string]): string = 
+proc getRssDescription*(subs: seq[string], normalize: bool = true): string = 
     result = Get ^RSSItem(subs, "description")
-    return result.parseHtml().innerText
-    #let description = s.parseHtml().innerText
-    #return hnswNormalize(description)
+    if normalize:
+        return hnswNormalize(result.parseHtml().innerText)
+    else:
+        return result.parseHtml().innerText
 
-proc getRssDescription*(rssref: string): string = 
+proc getRssDescription*(rssref: string, normalize: bool = true): string = 
     if rssref.len > 0 and rssref.contains(","):
         let subs = rssref.split(",")
-        getRssDescription(subs)
-    else:
-        return ""
+        return getRssDescription(subs, normalize)
 
-proc getRssDescription*(id: int): string = 
-    getRssDescription(getRssRef(id))
+proc getRssDescription*(id: int, normalize: bool = true): string = 
+    getRssDescription(getRssRef(id), normalize)
