@@ -1,4 +1,4 @@
-import ../ydbhnsw
+import ydbhnsw
 import std/[strutils]
 
 proc convertInt64ToUint32(global: string) =

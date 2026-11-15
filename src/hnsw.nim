@@ -1252,6 +1252,11 @@ proc lookup*(ix: HnswIndex, key: string): int =
   let s = ydb_get(GLOBALKEY)
   if s.len == 0: -1 else: parseInt(s)
 
+proc lookup*(ix: HnswIndex, key: int): string =
+  ## Node id stored for `key`, or "" if that key was never indexed.
+  GLOBALKEY.setSub(0, key)
+  ydb_get(GLOBALKEY)
+
 # ---------------------------------------------------------------------------
 # in-process link mirror
 # ---------------------------------------------------------------------------
