@@ -43,3 +43,10 @@ task runHnsw, "Build and run hnsw_search":
 task runService, "Build and run the HNSW HTTP service":
   exec "nim c --threads:on --mm:orc -d:release src/hnsw_service.nim"
   exec "./src/hnsw_service"
+
+# Chat with a local GGUF model (src/llama_chat.nim + llama_chat_shim.c). Uses the
+# same llama.cpp build as the embedding backend; the model defaults to
+# ~/models/gguf/Qwen3-1.7B-Q4_K_M.gguf (override with QWEN_GGUF or --model).
+task qwenChat, "Build and run the Qwen3 chat REPL":
+  exec "nim c -d:release -o:bin/qwen_chat src/examples/qwen_chat.nim"
+  exec "./bin/qwen_chat"

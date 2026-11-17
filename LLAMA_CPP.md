@@ -275,3 +275,37 @@ Levers worth knowing:
   `HNSW_EMBED_MAX_TOKENS` (128), `HNSW_EMBED_POOLING` (mean),
   `HNSW_EMBED_GPU_LAYERS` (auto: all layers when a GPU backend exists, else CPU),
   `HNSW_LLAMA_LOG` (off).
+
+## Chat / text generation (Qwen3-1.7B, added 2026-11-17)
+
+The same llama.cpp build also serves generation; the index does not use it.
+
+- **`src/llama_chat.nim`** - a chat API on top of the model: `loadChat`,
+  `ask` (one turn, streams tokens to a callback, keeps the history), `resetChat`,
+  `closeChat`. Sampling is a llama.cpp chain (top-k -> top-p -> min-p -> temp ->
+  dist, or greedy), `ChatStats` reports prompt/generated token counts.
+- **`src/llama_chat_shim.c`** - the struct-by-value bridge (model/context params,
+  `llama_batch`, sampler chain), same rationale as `llama_shim.c`.
+- **`src/examples/qwen_chat.nim`** - REPL: `nimble qwenChat`, or
+  `nim c -d:release src/examples/qwen_chat.nim && ./src/examples/qwen_chat`.
+  `-p "..."` answers one prompt and exits; `/reset`, `/exit` in the REPL;
+  `--think` enables the `<think>` block, `--ctx`, `--max-tokens`, `--temp`,
+  `--top-p`, `--greedy`, `--no-gpu`, `--verbose`.
+- **`-a f1 -b f2`** builds a merge prompt from the two files (fenced `TEXT A` /
+  `TEXT B`, facts preserved, duplicates merged, no preamble), sends it once and
+  prints only the result on stdout - `qwen_chat -a p1.md -b p2.md --temp 0.3 >
+  merged.md`. `-a -` or `-b -` reads that side from stdin, `--task "..."`
+  replaces the merge instruction (e.g. compare instead of merge). Merge quality
+  at 1.7B: use `--temp 0.2-0.4` or `--greedy`; details still need checking.
+- Model: `~/models/gguf/Qwen3-1.7B-Q4_K_M.gguf` (override with `-m` or
+  `QWEN_GGUF`), 40960-token training context, default `nCtx` 4096.
+- Qwen3 switches reasoning off with an already closed `<think>\n\n</think>\n\n`
+  block after `<|im_start|>assistant\n`; llama.cpp's built-in chatml template has
+  no `enable_thinking` variable, so `llama_chat` appends that itself when the
+  GGUF template mentions `enable_thinking`. No-think defaults are Qwen's
+  recommended 0.7/0.8/top-k 20, thinking 0.6/0.95/20.
+- Measured on the GTX 1060: load ~0.55 s, **~72-78 tok/s** generated (all layers
+  offloaded), ~53-60 tok/s on a second turn (prompt re-decode); CPU-only ~8 tok/s.
+- The whole conversation is cleared from the KV cache and re-decoded every turn
+  (`chat_clear_kv`), which keeps multi-turn state trivial; prefix caching is the
+  obvious optimisation if long chats ever matter.
